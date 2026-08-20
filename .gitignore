@@ -19,3 +19,6 @@ __pycache__/
 
 # Base weights — download via ultralytics
 yolo11n.pt
+
+# NIRDet model checkpoints — kept locally, not in git
+nirdet/checkpoints/
