@@ -1089,12 +1089,12 @@ Part D — Uncertain Parameters and Resolving Experiments
 The following parameters have been set to reasonable defaults but require
 empirical validation on YOUR dataset and hardware.
 
-1. ANCHOR SIZES (cfg.model.anchor_sizes)
-   Current: ((16,40), (32,80), (64,160)) — estimated from typical surveillance geometry.
-   Uncertainty: Completely dataset-dependent. Wrong anchors → poor recall.
-   Experiment: Run k-means clustering on all bounding box w,h values in your
-   training labels (scaled to input resolution). Use k=3 or k=6.
-   Tool: python tools/compute_anchors.py --labels ./data/nirdet/labels/train --k 3
+1. BOX PRIORS (cfg.model.prior_w, prior_h)
+   Current: (0.04, 0.15) — from miniNIRPed GT stats (w≈0.04, h≈0.15).
+   Uncertainty: Dataset-dependent. Wrong priors bias the w/h regression init
+   (reg_pred bias = log(prior)).
+   Experiment: Recompute mean w and mean h over your training labels (normalized
+   coords) and update prior_w/prior_h accordingly.
 
 2. NORMALIZATION STATS (cfg.aug.normalize_mean, normalize_std)
    Current: mean=0.5, std=0.25 — generic NIR prior.
@@ -1141,14 +1141,15 @@ empirical validation on YOUR dataset and hardware.
    Experiment: Train with "focal" and tune focal_gamma in {0.5, 1.0, 2.0}.
    Monitor class precision — if model predicts background as person, focal helps.
 
-9. ATTENTION TYPE (cfg.model.attention_type)
-   Current: "cbam".
-   Uncertainty: ECA attention has near-zero params but may be equally effective.
-   Experiment: Ablate {"cbam", "se", "eca"} with all other params fixed.
+9. EAA FREEZE SCHEDULE (cfg.model.eaa_freeze_epochs)
+   Current: 5 — Sobel-initialized edge_conv kernels frozen for 5 epochs, then
+   trainable. EAA is hardwired (EdgeAwareAttention, not CBAM/SE/ECA).
+   Uncertainty: Optimal freeze length is dataset-dependent.
+   Experiment: Ablate {0, 3, 5, 10} with all other params fixed.
    Metric: mAP50 vs param count tradeoff.
 
 10. BACKBONE DEPTH/WIDTH TRADEOFF (cfg.model.backbone_channels, backbone_depths)
-    Current: (16,32,64,128,256) / (1,2,3,2,1) — estimated to hit ~4M params.
+    Current: (16,32,128,256,256) / (1,2,2,1) — matches the implemented backbone.
     Uncertainty: Optimal channel/depth ratio is architecture-specific.
     Experiment: Fix total param budget at 4M. Compare wider+shallower vs
     narrower+deeper variants. Use NAS-style grid search if compute allows.
