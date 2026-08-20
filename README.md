@@ -24,7 +24,7 @@ graph LR
     S --> E["EdgeAwareAttention<br/>Sobel edge map from the RAW image · F·(1 + 0.5·A)<br/>applied after all 4 stages"]
     E --> F["LightweightFPN<br/>top-down fusion · 256ch output"]
     F --> H["PedestrianHead<br/>anchor-free · decoupled cls/reg branches"]
-    H --> O["(cx, cy, w, h, conf)<br/>sigmoid centres · exp(w/h)·img_size"]
+    H --> O["Output: (cx, cy, w, h, conf)<br/>sigmoid centres · exp(w/h)·img_size"]
 ```
 
 ### Components
@@ -46,7 +46,7 @@ graph LR
 | **Full training** | 261 train / 160 val, 100 epochs | **0.5846** |
 | YOLO11n baseline (COCO-pretrained) | same split, fine-tuned | 0.735 |
 
-- Training loss: 2.14 → 0.53 (no NaN, no divergence)
+- Training loss: 2.14 → ~0.54 (lowest 0.535 @ epoch 94; no NaN, no divergence)
 - Validation mAP50 climbs steadily: 0.042 (ep5) → 0.221 (ep10) → 0.490 (ep30) → **0.585 (ep75)**, then plateaus; early stopping fires at ep95 after 4 evals without gain
 - The 0.735 baseline is a COCO-**pretrained** YOLO11n; NIRDet trains **from scratch** on 261 images. The −0.15 gap is the pretraining gap, not a pipeline defect — the overfit test (mAP 1.0) proves the model fits and the loss/decode/metric path is fully consistent.
 
@@ -93,7 +93,10 @@ python test_backbone.py    # pass — shapes, param budget, gradients, Sobel ini
 python test_head.py        # pass — shapes, priors, decode consistency (train == infer)
 python test_neck.py        # 3/3  — shapes, gradient flow, information flow
 python losses.py           # 4/4  — empty GT, assignment, NaN guard, loss direction
-python test_model.py       # forward (train/infer), param count
+python test_model.py       # Tests 1–3: forward (train/infer), param count
+                           # Test 4 (overfit) is opt-in: --overfit --images 4x --labels 4x
+                           # (uses a simplified proxy loss; the real end-to-end
+                           #  overfit check is `python train.py --overfit-test`)
 ```
 
 The train/inference decode-consistency tests guarantee the model optimises the same
