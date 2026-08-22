@@ -46,6 +46,32 @@ graph LR
 | **Full training** | 261 train / 160 val, 100 epochs | **0.5846** |
 | YOLO11n baseline (COCO-pretrained) | same split, fine-tuned | 0.735 |
 
+### Evaluation — Phase 9 (checkpoints/best.pth, epoch 75, val split = 160 images, RTX 4050 Laptop)
+
+**Accuracy** (trainable params: 4,851,754)
+
+| Metric | Value |
+|---|---|
+| mAP50 | **0.5846** (baseline YOLO11n: 0.7350, Δ −0.1504) |
+| mAP@75 | 0.2127 |
+| mAR@300 | 0.4084 |
+| mAP small / medium / large | 0.0571 / 0.3377 / 0.3804 |
+| Best-F1 operating point | conf 0.318 → P 0.657 / R 0.590 / F1 0.622 |
+
+**Latency** (evaluate.py, FP32)
+
+| Device | Resolution | Latency | Throughput |
+|---|---|---|---|
+| GPU — RTX 4050 Laptop | 640×640 | 29.26 ± 6.77 ms | 34.2 FPS |
+| CPU | 640×640 | 249.8 ± 16.4 ms | 4.00 FPS |
+| CPU | 320×320 | 102.8 ± 16.0 ms | 9.73 FPS |
+| Raspberry Pi 5 (estimate) | 640×640 | ~0.80–1.33 FPS | 3–5× CPU slowdown; PyTorch FP32 — not yet NCNN-converted |
+
+**Hard cases & deployment**
+
+- 4 pure false-negative images saved to `eval_outputs/hard_cases/`
+- **Deployment status:** not yet deployable on Pi 5 at real-time speed in current PyTorch form. Next step: ONNX export → NCNN conversion → INT8 quantization → on-device benchmark.
+
 - Training loss: 2.14 → ~0.54 (lowest 0.535 @ epoch 94; no NaN, no divergence)
 - Validation mAP50 climbs steadily: 0.042 (ep5) → 0.221 (ep10) → 0.490 (ep30) → **0.585 (ep75)**, then plateaus; early stopping fires at ep95 after 4 evals without gain
 - The 0.735 baseline is a COCO-**pretrained** YOLO11n; NIRDet trains **from scratch** on 261 images. The −0.15 gap is the pretraining gap, not a pipeline defect — the overfit test (mAP 1.0) proves the model fits and the loss/decode/metric path is fully consistent.
