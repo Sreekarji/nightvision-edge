@@ -77,7 +77,8 @@ CFG = {
     # ── Data loader ──────────────────────────────────────────────────────────
     "batch_size":    8,         # tune down to 4 if OOM
     "num_workers":   4,         # Windows: set to 0 if DataLoader hangs
-    "img_size":      640,
+    "img_h":         384,       # target input height (640×384 geometry)
+    "img_w":         640,       # target input width
 
     # ── Mixed precision ──────────────────────────────────────────────────────
     # "fp16", "bf16", or "fp32"
@@ -333,7 +334,7 @@ def train_one_epoch(
 
         # ── Forward pass under autocast ──────────────────────────────────────
         with amp_ctx:
-            # training=True returns raw logits: [(B,6400,5),(B,1600,5),(B,400,5)]
+            # training=True returns raw logits: [(B,3840,5),(B,960,5),(B,240,5)]
             outputs = model(images, training_mode=True)
 
         # ── Loss computation OUTSIDE autocast (fp32 for numerical safety) ────
@@ -431,16 +432,18 @@ def main(args):
     if args.smoke_test or args.overfit_test:
         train_ds = NIRDetDataset(
             root=cfg["data_root"], split="train",
-            img_size=cfg["img_size"], augment=False   # FIX: disable augmentation for smoke/overfit tests
+            img_h=cfg["img_h"], img_w=cfg["img_w"],
+            augment=False   # FIX: disable augmentation for smoke/overfit tests
         )
     else:
         train_ds = NIRDetDataset(
             root=cfg["data_root"], split="train",
-            img_size=cfg["img_size"]
+            img_h=cfg["img_h"], img_w=cfg["img_w"]
         )
     val_ds = NIRDetDataset(
         root=cfg["data_root"], split="val",
-        img_size=cfg["img_size"], augment=False   # FIX: dataset default is augment=True; validation must be deterministic
+        img_h=cfg["img_h"], img_w=cfg["img_w"],
+        augment=False   # FIX: dataset default is augment=True; validation must be deterministic
     )
 
     if args.smoke_test or args.overfit_test:
@@ -485,7 +488,14 @@ def main(args):
     log.info(f"Trainable parameters: {n_params:,}")
 
     # ── Loss ──────────────────────────────────────────────────────────────────
-    criterion = NIRDetLoss(lambda_cls=1.0, lambda_reg=2.0).to(device)
+    # Grid sizes derive from (img_h, img_w) ÷ strides (8,16,32):
+    #   e.g. 384×640 → ((48,80), (24,40), (12,20)).
+    # Each entry is (S_h, S_w) — losses.py must receive the rectangular tuple
+    # form, otherwise assign/decode use square math on a non-square grid.
+    grid_sizes = tuple(
+        (cfg["img_h"] // s, cfg["img_w"] // s) for s in (8, 16, 32)
+    )
+    criterion = NIRDetLoss(grid_sizes=grid_sizes, lambda_cls=1.0, lambda_reg=5.0).to(device)
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
     if cfg["optimizer"] == "adamw":
@@ -636,6 +646,27 @@ def main(args):
     log.info(f"  Avg epoch time:     {avg_epoch_time:.1f}s")
     log.info(f"  Best checkpoint:    {ckpt_dir / 'best.pth'}")
     log.info("=" * 60)
+
+    # ── Auto-evaluate on the best checkpoint just saved ──────────────────────
+    # Normal completion only: reached after the training loop finishes (or
+    # early-stops cleanly).  Skipped for smoke/overfit modes, which train on
+    # a 10-image subset — running the full val suite on that is meaningless.
+    # An interrupted run never reaches this point.
+    if not (args.smoke_test or args.overfit_test):
+        best_ckpt_path = ckpt_dir / "best.pth"
+        if best_ckpt_path.exists():
+            log.info(f"Auto-evaluating with evaluate.py on {best_ckpt_path} …")
+            import subprocess, sys
+            subprocess.run([
+                sys.executable, "evaluate.py",
+                "--checkpoint", str(best_ckpt_path),
+                "--data-root",  cfg["data_root"],
+            ], check=True)
+        else:
+            log.warning(
+                f"No best checkpoint saved (mAP50 never improved) — "
+                f"skipping auto-evaluation."
+            )
 
 
 # ════════════════════════════════════════════════════════════════════════════

@@ -48,37 +48,39 @@ def fpn() -> LightweightFPN:
 def test_output_shapes(fpn: LightweightFPN) -> None:
     """
     Given config backbone_channels = (16, 32, 64, 128, 256):
-        C3  = backbone_channels[2] = 64   → P3 shape (1, 64,  80, 80)
-        C4  = backbone_channels[3] = 128  → P4 shape (1, 128, 40, 40)
-        C5  = backbone_channels[4] = 256  → P5 shape (1, 256, 20, 20)
+        C3  = backbone_channels[2] = 64   → P3 shape (1, 64,  48, 80)
+        C4  = backbone_channels[3] = 128  → P4 shape (1, 128, 24, 40)
+        C5  = backbone_channels[4] = 256  → P5 shape (1, 256, 12, 20)
         OUT = backbone_channels[-1] = 256
 
+    Spatial sizes match a 640×384 input (384/8=48 rows, 640/8=80 cols, etc.).
+
     Expect:
-        N3 = (1, 256, 80, 80)
-        N4 = (1, 256, 40, 40)
-        N5 = (1, 256, 20, 20)
+        N3 = (1, 256, 48, 80)
+        N4 = (1, 256, 24, 40)
+        N5 = (1, 256, 12, 20)
     """
     # Build dummy inputs — shapes are driven entirely by _C3/_C4/_C5 from config
-    p3 = torch.zeros(1, _C3, 80, 80)   # (1, 64,  80, 80)
-    p4 = torch.zeros(1, _C4, 40, 40)   # (1, 128, 40, 40)
-    p5 = torch.zeros(1, _C5, 20, 20)   # (1, 256, 20, 20)
+    p3 = torch.zeros(1, _C3, 48, 80)   # (1, 64,  48, 80)
+    p4 = torch.zeros(1, _C4, 24, 40)   # (1, 128, 24, 40)
+    p5 = torch.zeros(1, _C5, 12, 20)   # (1, 256, 12, 20)
 
     with torch.no_grad():
         n3, n4, n5 = fpn(p3, p4, p5)
 
     # ── N3 ────────────────────────────────────────────────────────────────────
-    assert n3.shape == (1, _OUT, 80, 80), (
-        f"N3 shape mismatch: expected (1, {_OUT}, 80, 80), got {tuple(n3.shape)}"
+    assert n3.shape == (1, _OUT, 48, 80), (
+        f"N3 shape mismatch: expected (1, {_OUT}, 48, 80), got {tuple(n3.shape)}"
     )
 
     # ── N4 ────────────────────────────────────────────────────────────────────
-    assert n4.shape == (1, _OUT, 40, 40), (
-        f"N4 shape mismatch: expected (1, {_OUT}, 40, 40), got {tuple(n4.shape)}"
+    assert n4.shape == (1, _OUT, 24, 40), (
+        f"N4 shape mismatch: expected (1, {_OUT}, 24, 40), got {tuple(n4.shape)}"
     )
 
     # ── N5 ────────────────────────────────────────────────────────────────────
-    assert n5.shape == (1, _OUT, 20, 20), (
-        f"N5 shape mismatch: expected (1, {_OUT}, 20, 20), got {tuple(n5.shape)}"
+    assert n5.shape == (1, _OUT, 12, 20), (
+        f"N5 shape mismatch: expected (1, {_OUT}, 12, 20), got {tuple(n5.shape)}"
     )
 
 
@@ -100,9 +102,9 @@ def test_gradient_flow() -> None:
     model.train()
 
     # Input shapes from config — no literals
-    p3 = torch.randn(1, _C3, 80, 80, requires_grad=True)   # (1, 64,  80, 80)
-    p4 = torch.randn(1, _C4, 40, 40, requires_grad=True)   # (1, 128, 40, 40)
-    p5 = torch.randn(1, _C5, 20, 20, requires_grad=True)   # (1, 256, 20, 20)
+    p3 = torch.randn(1, _C3, 48, 80, requires_grad=True)   # (1, 64,  48, 80)
+    p4 = torch.randn(1, _C4, 24, 40, requires_grad=True)   # (1, 128, 24, 40)
+    p5 = torch.randn(1, _C5, 12, 20, requires_grad=True)   # (1, 256, 12, 20)
 
     n3, n4, n5 = model(p3, p4, p5)
 
@@ -149,9 +151,9 @@ def test_information_flow(fpn: LightweightFPN) -> None:
         N3 = out3(TD3)              ≠ 0  (Kaiming init + BN with gamma=1)
     """
     # Input shapes from config — no literals
-    p3 = torch.zeros(1, _C3, 80, 80)   # (1, 64,  80, 80) all zeros
-    p4 = torch.zeros(1, _C4, 40, 40)   # (1, 128, 40, 40) all zeros
-    p5 = torch.ones(1,  _C5, 20, 20)   # (1, 256, 20, 20) all ones — only signal
+    p3 = torch.zeros(1, _C3, 48, 80)   # (1, 64,  48, 80) all zeros
+    p4 = torch.zeros(1, _C4, 24, 40)   # (1, 128, 24, 40) all zeros
+    p5 = torch.ones(1,  _C5, 12, 20)   # (1, 256, 12, 20) all ones — only signal
 
     with torch.no_grad():
         n3, n4, n5 = fpn(p3, p4, p5)

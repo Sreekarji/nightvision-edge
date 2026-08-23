@@ -30,7 +30,7 @@ from albumentations.core.bbox_utils import BboxProcessor
 # Augmentation pipeline
 # ---------------------------------------------------------------------------
 
-def build_train_transforms(img_size: int = 640) -> A.Compose:
+def build_train_transforms(img_h: int = 384, img_w: int = 640) -> A.Compose:
     """
     Albumentations pipeline for training.
 
@@ -81,19 +81,21 @@ def build_train_transforms(img_size: int = 640) -> A.Compose:
     return A.Compose(
         [
             # --- Geometric (bbox-aware) ---
-            A.LongestMaxSize(max_size=img_size, p=1.0),
+            A.LongestMaxSize(max_size=max(img_h, img_w), p=1.0),
             A.PadIfNeeded(
-                min_height=img_size,
-                min_width=img_size,
+                min_height=img_h,
+                min_width=img_w,
                 border_mode=cv2.BORDER_CONSTANT,
                 fill=0,
                 p=1.0,
             ),
             A.HorizontalFlip(p=0.5),
             A.RandomResizedCrop(
-                size=(img_size, img_size),
+                size=(img_h, img_w),
                 scale=(0.8, 1.0),
-                ratio=(0.75, 1.33),
+                ratio=(1.2, 2.2),   # recentred on W/H = 640/384 = 1.667; the square
+                                    # default (0.75, 1.33) squashes box w/h toward 1.0
+                                    # at a non-square target (measured +9.5% + dropout)
                 p=0.5,
             ),
             # --- Photometric (image only, bbox unchanged) ---
@@ -120,14 +122,14 @@ def build_train_transforms(img_size: int = 640) -> A.Compose:
     )
 
 
-def build_val_transforms(img_size: int = 640) -> A.Compose:
+def build_val_transforms(img_h: int = 384, img_w: int = 640) -> A.Compose:
     """Deterministic resize + pad only — no augmentation."""
     return A.Compose(
         [
-            A.LongestMaxSize(max_size=img_size, p=1.0),
+            A.LongestMaxSize(max_size=max(img_h, img_w), p=1.0),
             A.PadIfNeeded(
-                min_height=img_size,
-                min_width=img_size,
+                min_height=img_h,
+                min_width=img_w,
                 border_mode=cv2.BORDER_CONSTANT,
                 fill=0,
                 p=1.0,
@@ -156,15 +158,17 @@ class NIRDetDataset(Dataset):
         ``labels/{split}`` sub-directories.
     split : str
         "train" or "val".
-    img_size : int
-        Target square resolution (applied by the augmentation pipeline).
+    img_h : int
+        Target image height (applied by the augmentation pipeline).
+    img_w : int
+        Target image width (applied by the augmentation pipeline).
     augment : bool
         If True, use the training augmentation pipeline; otherwise use the
         deterministic validation pipeline.
 
     __getitem__ returns
     -------------------
-    image  : torch.float32 tensor of shape (1, img_size, img_size)
+    image  : torch.float32 tensor of shape (1, img_h, img_w)
              Values are in [0.0, 1.0].  No ImageNet normalisation is applied
              because ImageNet statistics are computed from RGB imagery.  For
              single-channel NIR, the correct approach is either:
@@ -188,13 +192,15 @@ class NIRDetDataset(Dataset):
         self,
         root: str | Path,
         split: str = "train",
-        img_size: int = 640,
+        img_h: int = 384,
+        img_w: int = 640,
         augment: bool = True,
     ) -> None:
         super().__init__()
         self.root = Path(root)
         self.split = split
-        self.img_size = img_size
+        self.img_h = img_h
+        self.img_w = img_w
 
         self.img_dir = self.root / "images" / split
         self.lbl_dir = self.root / "labels" / split
@@ -215,9 +221,9 @@ class NIRDetDataset(Dataset):
             )
 
         self.transforms = (
-            build_train_transforms(img_size)
+            build_train_transforms(img_h, img_w)
             if augment
-            else build_val_transforms(img_size)
+            else build_val_transforms(img_h, img_w)
         )
 
     # ------------------------------------------------------------------
@@ -411,7 +417,8 @@ def collate_fn(
 def build_dataloader(
     root: str | Path,
     split: str,
-    img_size: int = 640,
+    img_h: int = 384,
+    img_w: int = 640,
     batch_size: int = 8,
     num_workers: int = 4,
     shuffle: Optional[bool] = None,
@@ -420,7 +427,7 @@ def build_dataloader(
     augment = split == "train"
     if shuffle is None:
         shuffle = augment
-    ds = NIRDetDataset(root, split=split, img_size=img_size, augment=augment)
+    ds = NIRDetDataset(root, split=split, img_h=img_h, img_w=img_w, augment=augment)
     return DataLoader(
         ds,
         batch_size=batch_size,

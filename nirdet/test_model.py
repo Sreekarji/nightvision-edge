@@ -61,7 +61,7 @@ def test1_training_forward() -> bool:
     model = NIRDet()
     model.train()
 
-    x = torch.zeros(2, 1, 640, 640)
+    x = torch.zeros(2, 1, 384, 640)
     with torch.no_grad():
         preds = model(x, training_mode=True)
 
@@ -69,7 +69,7 @@ def test1_training_forward() -> bool:
     ok &= _assert(isinstance(preds, list) and len(preds) == 3,
                   "returns list of 3 tensors", f"got {type(preds)}")
 
-    expected_shapes = [(2, 6400, 5), (2, 1600, 5), (2, 400, 5)]
+    expected_shapes = [(2, 3840, 5), (2, 960, 5), (2, 240, 5)]
     for i, (pred, exp) in enumerate(zip(preds, expected_shapes)):
         ok &= _assert(
             tuple(pred.shape) == exp,
@@ -77,7 +77,8 @@ def test1_training_forward() -> bool:
             f"got {tuple(pred.shape)}"
         )
 
-    # Shapes: 640/8=80 → 80*80=6400; 640/16=40 → 1600; 640/32=20 → 400
+    # Shapes: 384/8=48, 640/8=80 → 48*80=3840; 384/16=24, 640/16=40 → 960;
+    #          384/32=12, 640/32=20 → 240
     return ok
 
 
@@ -99,7 +100,7 @@ def test2_inference_forward() -> bool:
     model = NIRDet()
     model.eval()
 
-    x = torch.zeros(1, 1, 640, 640)
+    x = torch.zeros(1, 1, 384, 640)
     with torch.no_grad():
         results = model(x, training_mode=False)
 
@@ -128,8 +129,8 @@ def test2_inference_forward() -> bool:
             f"x1_min={boxes[:,0].min().item():.1f}, x2_max={boxes[:,2].max().item():.1f}"
         )
         ok &= _assert(
-            boxes[:, 1].min().item() >= 0 and boxes[:, 3].max().item() <= 640,
-            "box y-coords within [0, 640]",
+            boxes[:, 1].min().item() >= 0 and boxes[:, 3].max().item() <= 384,
+            "box y-coords within [0, 384]",
             f"y1_min={boxes[:,1].min().item():.1f}, y2_max={boxes[:,3].max().item():.1f}"
         )
     else:

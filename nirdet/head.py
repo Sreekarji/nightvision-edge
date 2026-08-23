@@ -72,8 +72,8 @@ class PedestrianHead(nn.Module):
         strides: Tuple[int, int, int] = (8, 16, 32),
         num_branch_convs: int = 2,
         prior_prob: float = 0.01,
-        prior_w: float = 0.04,      # FIX: absolute width prior for miniNIRPed (was aspect_ratio_prior=0.4)
-        prior_h: float = 0.15,      # FIX: absolute height prior for miniNIRPed (was aspect_ratio_prior=0.4)
+        prior_w: float = 0.0461,    # median w at 640×384 pipeline (948 train labels, Step-1 measure)
+        prior_h: float = 0.1680,    # median h at 640×384 pipeline (948 train labels, Step-1 measure)
     ):
         super().__init__()
         self.strides = strides
@@ -119,14 +119,15 @@ class PedestrianHead(nn.Module):
         nn.init.constant_(self.reg_pred.bias, 0.0)
 
         # FIX: Use absolute priors for w/h instead of aspect-ratio prior.
-        # w_init = exp(log(prior_w)) = prior_w = 0.04 (matches miniNIRPed GT w≈0.04)
-        # h_init = exp(log(prior_h)) = prior_h = 0.15 (matches miniNIRPed GT h≈0.15)
+        # w_init = exp(log(prior_w)) = prior_w = 0.0461 (median w over 948 train labels,
+        #          measured through the 640×384 val pipeline)
+        # h_init = exp(log(prior_h)) = prior_h = 0.1680 (median h, same measurement)
         with torch.no_grad():
             # reg_pred.bias layout: [t_cx, t_cy, t_w, t_h]
             self.reg_pred.bias[0] = 0.0                 # t_cx: no prior, center offset starts at 0
             self.reg_pred.bias[1] = 0.0                 # t_cy: no prior, center offset starts at 0
-            self.reg_pred.bias[2] = math.log(prior_w)   # FIX: t_w = log(prior_w) = -3.22 → exp = 0.04
-            self.reg_pred.bias[3] = math.log(prior_h)   # FIX: t_h = log(prior_h) = -1.90 → exp = 0.15
+            self.reg_pred.bias[2] = math.log(prior_w)   # FIX: t_w = log(0.0461) = -3.08 → exp = 0.0461
+            self.reg_pred.bias[3] = math.log(prior_h)   # FIX: t_h = log(0.1680) = -1.78 → exp = 0.1680
 
     @staticmethod
     def _make_grid(h: int, w: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -208,15 +209,20 @@ class PedestrianHead(nn.Module):
                 cx = (torch.sigmoid(t_cx) + grid_x) * stride  # (B, H, W) -- center x in pixels
                 cy = (torch.sigmoid(t_cy) + grid_y) * stride  # (B, H, W) -- center y in pixels
                 # FIX Bug5: losses.py decodes w_norm = exp(t_w) in [0,1] space;
-                #   to convert to pixels: w_px = w_norm * img_size = exp(t_w) * H * stride.
+                #   to convert to pixels: w_px = w_norm * img_w_px, h_px = h_norm * img_h_px.
                 #   The original code used only * stride, giving w ~80x too small
                 #   (e.g. exp(log(0.04)) * 8 = 0.32 px instead of 0.04 * 640 = 25.6 px).
+                # FIX (640×384): the old code scaled BOTH w and h by H*stride (the image
+                #   height).  w must be scaled by the image WIDTH (W*stride) — at non-square
+                #   input, H*stride made inferred widths 384/640 = 0.6x too narrow.
                 # Clamp raw logits before exp to prevent fp32 overflow (exp(89)=inf).
-                # max=4.0 → exp(4)*img_size ≈ 54*640 = 34560 px (huge but finite).
-                # The NMS score threshold will discard degenerate boxes before they matter.
-                img_size = float(H * stride)
-                w  = torch.exp(t_w.clamp(min=-8.0, max=4.0)) * img_size  # pixels  FIX: *img_size not *stride
-                h  = torch.exp(t_h.clamp(min=-8.0, max=4.0)) * img_size  # pixels  FIX: *img_size not *stride
+                # max=4.0 → exp(4)*640 ≈ 34560 px wide / exp(4)*384 ≈ 20736 px tall
+                #   (huge but finite).  The NMS score threshold will discard degenerate
+                #   boxes before they matter.
+                img_w_px = float(W * stride)  # full image width in px at this scale
+                img_h_px = float(H * stride)  # full image height in px at this scale
+                w  = torch.exp(t_w.clamp(min=-8.0, max=4.0)) * img_w_px  # pixels
+                h  = torch.exp(t_h.clamp(min=-8.0, max=4.0)) * img_h_px  # pixels
 
                 conf_2d = conf[:, 0, :, :]  # (B, H, W)
 

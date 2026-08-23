@@ -115,14 +115,15 @@ applicable here since we predict (cx_offset, cy_offset, w, h) not distances.
 Decode as ACTUALLY implemented in head.py (post Bug4/Bug5 fixes):
   cx = (sigmoid(t_cx) + grid_x) * stride   # FIX: sigmoid-bounded offset (Bug4); grid_x = column index; the +0.5 was removed
   cy = (sigmoid(t_cy) + grid_y) * stride
-  w  = exp(t_w) * img_size                 # FIX: *img_size (= H*stride), not *stride (Bug5)
-  h  = exp(t_h) * img_size
+  w  = exp(t_w) * (W * stride)             # FIX: *img_w_px (= W*stride), not *stride (Bug5);
+                                           # per-axis: w by image WIDTH, h by image HEIGHT
+  h  = exp(t_h) * (H * stride)             #      (identical to *img_size for square inputs)
 
 sigmoid(t_cx/t_cy) bounds the center inside its cell (matches the training
-label assignment); exp(t_w/t_h)*img_size decodes width/height in pixels and
-matches losses.py's normalized-space decode once the w/h max=1.0 cap is removed
-there. (The previous docstring described the pre-bugfix unbounded/exp*stride
-decode and is no longer accurate.)
+label assignment); exp(t_w/t_h) multiplied by the per-axis pixel extent decodes
+width/height in pixels and matches losses.py's normalized-space decode once the
+w/h max=1.0 cap is removed there. (The previous docstring described the
+pre-bugfix unbounded/exp*stride decode and is no longer accurate.)
 One subtlety: w and h use stride rather than anchor size because our head is
 anchor-free (FCOS-style assignment), so stride is the natural scale factor
 — each grid cell covers stride×stride pixels.
@@ -196,6 +197,8 @@ class NIRDet(nn.Module):
         nms_iou_thresh: float = 0.45,
         nms_score_thresh: float = 0.25,
         strides: Tuple[int, int, int] = (8, 16, 32),
+        prior_w: float = 0.0461,   # median w at 640×384 pipeline (must match head.py defaults)
+        prior_h: float = 0.1680,   # median h at 640×384 pipeline (must match head.py defaults)
     ) -> None:
         super().__init__()
 
@@ -242,6 +245,8 @@ class NIRDet(nn.Module):
             feat_channels=256,
             strides=strides,
             num_branch_convs=2,
+            prior_w=prior_w,   # FIX: forward priors instead of silently using head defaults
+            prior_h=prior_h,
         )
 
         # ── Weight init gap-fill ──────────────────────────────────────────────
@@ -300,7 +305,8 @@ class NIRDet(nn.Module):
                 last dim = (t_cx, t_cy, t_w, t_h, conf_logit) — raw logits
 
             training_mode=False:
-                List of 2 tensors: [boxes (N,4), scores (N,)]
+                List of B items, each a two-element list [boxes (N,4), scores (N,)]
+                where B is the batch size.
                 boxes in (x1,y1,x2,y2) pixel coords, scores in [0,1]
                 after NMS with self.nms_score_thresh / self.nms_iou_thresh.
                 (Batch size must be 1 for inference; batched NMS is Phase 7.)
