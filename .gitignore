@@ -23,3 +23,4 @@ yolo11n.pt
 # NIRDet model checkpoints — kept locally, not in git
 nirdet/checkpoints/
 nirdet/eval_outputs/hard_cases/
+nirdet/debug_aug.jpg
