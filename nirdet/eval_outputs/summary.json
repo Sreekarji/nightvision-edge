@@ -1,0 +1,61 @@
+{
+  "checkpoint": "C:\\projects\\nightvision\\nirdet\\checkpoints\\best.pth",
+  "epoch": 85,
+  "n_val": 160,
+  "n_params": 4851754,
+  "map50": 0.5951482057571411,
+  "baseline_map50": 0.735,
+  "delta": -0.13985179424285887,
+  "map5095": -1.0,
+  "map75": 0.24645942449569702,
+  "map_small": 0.07072458416223526,
+  "map_medium": 0.3344218134880066,
+  "map_large": 0.4208813011646271,
+  "mar_300": 0.4214765131473541,
+  "best_f1_point": {
+    "precision": 0.6804979253112033,
+    "recall": 0.550000011920929,
+    "f1": 0.6083291254843003,
+    "score_thresh": 0.30078125,
+    "index": 55
+  },
+  "n_hard_cases": 4,
+  "latency_gpu": {
+    "mean_ms": 11.254559999997582,
+    "std_ms": 0.8778313885432423,
+    "fps": 88.85287385737114,
+    "img_size": [
+      384,
+      640
+    ],
+    "runs": 20,
+    "device": "cuda"
+  },
+  "latency_cpu": {
+    "mean_ms": 110.15892999980679,
+    "std_ms": 3.5370260571002263,
+    "fps": 9.077793330070962,
+    "img_size": [
+      384,
+      640
+    ],
+    "runs": 20,
+    "device": "cpu"
+  },
+  "latency_cpu_192x320": {
+    "mean_ms": 43.71409499999572,
+    "std_ms": 1.677550831764246,
+    "fps": 22.875916795260153,
+    "img_size": [
+      192,
+      320
+    ],
+    "runs": 20,
+    "device": "cpu"
+  },
+  "pi5_fps_estimate": {
+    "lo": 1.8155586660141925,
+    "hi": 3.025931110023654
+  },
+  "eaa_probe_map50": null
+}
