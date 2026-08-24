@@ -197,7 +197,12 @@ class PedestrianHead(nn.Module):
                 # Decode to input-image pixel coordinates (inference path).
                 conf = torch.sigmoid(conf_logit)  # (B, 1, H, W) -- values in [0, 1]
 
-                grid = self._make_grid(H, W, feat.device, feat.dtype)  # (H, W, 2) -- (x, y)
+                # FIX (bf16): build the grid in torch.float32 explicitly, NOT
+                # feat.dtype.  Under AMP autocast, feat is bf16; a bf16 grid
+                # quantises the integer cell coordinates and loses precision in
+                # the (sigmoid + grid) * stride decode.  Float32 grid keeps the
+                # integer cell offsets exact regardless of autocast state.
+                grid = self._make_grid(H, W, feat.device, torch.float32)  # (H, W, 2) -- (x, y)
                 grid_x = grid[..., 0].unsqueeze(0)  # (1, H, W)
                 grid_y = grid[..., 1].unsqueeze(0)  # (1, H, W)
 

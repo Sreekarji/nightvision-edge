@@ -134,6 +134,27 @@ def set_lr(optimizer, lr: float) -> None:
     for pg in optimizer.param_groups:
         pg["lr"] = lr
 
+
+def build_param_groups(model: nn.Module, weight_decay: float) -> list:
+    """Split model parameters into decay (2D+ conv/linear weights) and
+    no-decay (1D BN/GN scale+shift + all biases) groups.
+
+    Standard practice from YOLOv5, YOLOX, FCOS: normalisation layer
+    scale/shift params and all biases are exempt from weight decay,
+    which prevents the effective gain of BN/GN from shrinking over
+    training — especially important on small datasets (261 images).
+    """
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if p.ndim <= 1 or name.endswith(".bias"):
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    return [
+        {"params": decay,    "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
 # ════════════════════════════════════════════════════════════════════════════
 # MIXED-PRECISION HELPERS
 # ════════════════════════════════════════════════════════════════════════════
@@ -498,18 +519,19 @@ def main(args):
     criterion = NIRDetLoss(grid_sizes=grid_sizes, lambda_cls=1.0, lambda_reg=5.0).to(device)
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
+    # FIX: split params into decay/no-decay groups (biases + 1D BN/GN params
+    # exempt from weight decay).  Both optimizers consume the same groups.
+    param_groups = build_param_groups(model, cfg["weight_decay"])
     if cfg["optimizer"] == "adamw":
         optimizer = torch.optim.AdamW(
-            model.parameters(),
+            param_groups,
             lr=cfg["lr_start"],         # will be overwritten each epoch
-            weight_decay=cfg["weight_decay"],
         )
     else:
         optimizer = torch.optim.SGD(
-            model.parameters(),
+            param_groups,
             lr=cfg["lr_start"],
             momentum=cfg["momentum"],
-            weight_decay=cfg["weight_decay"],
             nesterov=True,
         )
 

@@ -83,6 +83,7 @@ class EdgeAwareAttention(nn.Module):
         pool_mode: str = "avg",
         residual_scale: Optional[float] = 0.5,
         padding_mode: str = "reflect",
+        normalize_edges: bool = True,
     ):
         super().__init__()
 
@@ -92,12 +93,15 @@ class EdgeAwareAttention(nn.Module):
             raise ValueError("pool_mode must be 'avg' or 'max'")
         if padding_mode not in ("reflect", "replicate", "zeros"):
             raise ValueError("padding_mode must be 'reflect', 'replicate', or 'zeros'")
+        if not isinstance(normalize_edges, bool):
+            raise ValueError("normalize_edges must be a bool")
 
         self.N = num_edge_filters
         self.freeze_epochs = freeze_epochs
         self.pool_mode = pool_mode
         self.residual_scale = residual_scale
         self.padding_mode = padding_mode
+        self.normalize_edges = normalize_edges
 
         self._current_epoch: int = 0
 
@@ -206,33 +210,24 @@ class EdgeAwareAttention(nn.Module):
             p.requires_grad = not frozen
 
     # ------------------------------------------------------------------ #
-    #  Forward                                                             #
+    #  Edge magnitude computation (shared across stages)                   #
     # ------------------------------------------------------------------ #
 
-    def forward(self, feat: torch.Tensor, img: torch.Tensor) -> torch.Tensor:
+    def compute_edge_magnitude(self, img: torch.Tensor) -> torch.Tensor:
         """
+        Run the learnable edge convolution on the raw image and return the
+        edge magnitude map.
+
         Args:
-            feat : backbone feature map — (B, C, H', W')
-                   e.g. P3=(B,C3,H/8,W/8), P4=(B,C4,H/16,W/16), P5=(B,C5,H/32,W/32)
-            img  : raw NIR image       — (B, 1, H, W)
+            img  : raw NIR image — (B, 1, H, W)
 
         Returns:
-            Attended feature map       — (B, C, H', W')   same shape as feat
-
-        Shape trace (example: img=640×640, P3 feat=80×80):
-          img   : (B, 1, 640, 640)
-          padded: (B, 1, 642, 642)   — reflect-pad 1 px each side
-          e_map : (B, N, 640, 640)   — edge_conv
-          e_mag : (B, N, 640, 640)   — abs() edge magnitude (always ≥ 0)
-          e_ds  : (B, N, H', W')     — adaptive pool to feature-map size
-          a_raw : (B, 1, H', W')     — 1×1 projection
-          attn  : (B, 1, H', W')     — sigmoid → [0, 1]
-          out   : (B, C, H', W')     — feat * attn  [or residual form]
+            e_mag : edge magnitude map — (B, N, H, W), all values >= 0.
+                    When ``normalize_edges=True``, each filter channel is
+                    divided by its per-image spatial mean (+1e-6), so the
+                    map is scale-invariant to image brightness and has mean
+                    ~1.0 per (batch, filter) channel.
         """
-        # ── shapes ─────────────────────────────────────────────────────────
-        B, C, Hf, Wf = feat.shape   # feature-map spatial size
-        _, _, H, W   = img.shape    # full NIR image spatial size
-
         # ── 1. Pad image for 'valid' edge conv with configurable padding mode
         #       padding=1 each side preserves H×W after 3×3 conv
         img_pad = F.pad(img, (1, 1, 1, 1), mode=self.padding_mode)
@@ -248,14 +243,44 @@ class EdgeAwareAttention(nn.Module):
         e_mag = torch.abs(e_map)
         # e_mag : (B, N, H, W)
 
+        # ── 3b. Optional brightness-normalisation (FIX: dark NIR frames)
+        #       On dark NIR frames (pixel values ~0.0–0.15), |Sobel| ≈ 0.04,
+        #       so a_raw = proj(e_ds) ≈ 0.08 and sigmoid(a_raw) ≈ 0.52
+        #       everywhere — the attention degenerates into a near-constant
+        #       scalar gain (~1.26× with residual_scale=0.5) with no spatial
+        #       variation.  Dividing each filter channel by its spatial mean
+        #       makes the relative edge strength (not the absolute brightness)
+        #       drive the attention.  The +1e-6 guards the all-flat image
+        #       (e_mag=0) against division by zero.
+        if self.normalize_edges:
+            denom = e_mag.mean(dim=(2, 3), keepdim=True) + 1e-6
+            e_mag = e_mag / denom
+        # e_mag : (B, N, H, W)  — mean ~1.0 per channel when normalised
+
+        return e_mag
+
+    def apply_to(self, feat: torch.Tensor, e_mag: torch.Tensor) -> torch.Tensor:
+        """
+        Apply a pre-computed edge magnitude map to a feature map.
+
+        Args:
+            feat  : backbone feature map — (B, C, H', W')
+            e_mag : edge magnitude map from ``compute_edge_magnitude`` —
+                    (B, N, H, W).  Same image as the one that produced feat.
+
+        Returns:
+            Attended feature map       — (B, C, H', W')   same shape as feat
+
+        This is the shared tail of the old forward(): pool → proj → sigmoid →
+        residual/multiplicative apply.  Splitting it out lets callers compute
+        the expensive full-resolution edge convolution ONCE per image and reuse
+        the magnitude map at every FPN scale instead of re-running it per scale.
+        """
+        # ── shapes ─────────────────────────────────────────────────────────
+        B, C, Hf, Wf = feat.shape   # feature-map spatial size
+
         # ── 4. Downsample edge magnitude map to feature-map resolution
-        #       adaptive_avg_pool2d chosen over bilinear (see Part A Q2):
-        #         • avg pooling: each output cell = mean of input region,
-        #           preserving relative edge density — strong edges stay
-        #           strong relative to flat regions.
-        #         • max pooling: preserves peak activations (better for
-        #           point-like edges) but can amplify noise; useful for
-        #           very fine structure.  Selectable via pool_mode.
+        #       adaptive_avg_pool2d preserves relative edge density
         if self.pool_mode == "avg":
             e_ds = F.adaptive_avg_pool2d(e_mag, (Hf, Wf))
         else:
@@ -271,21 +296,44 @@ class EdgeAwareAttention(nn.Module):
         # attn : (B, 1, H', W')
 
         # ── 7. Apply attention to feature map
-        #       Broadcast over C channels automatically (1 → C)
         if self.residual_scale is not None:
-            # Additive-residual: F * (1 + α*A)
-            #   • At A=0  → output = F   (no suppression of flat regions)
-            #   • At A=1  → output = F*(1+α)  (amplification capped)
-            #   • Preserves body-mass context even in low-edge regions
             out = feat * (1.0 + self.residual_scale * attn)
         else:
-            # Pure multiplicative: F * A
-            #   • At A≈0  → flat regions fully suppressed
-            #   • At A≈1  → edge regions pass through unchanged
             out = feat * attn
         # out : (B, C, H', W')
 
         return out
+
+    # ------------------------------------------------------------------ #
+    #  Forward                                                             #
+    # ------------------------------------------------------------------ #
+
+    def forward(self, feat: torch.Tensor, img: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            feat : backbone feature map — (B, C, H', W')
+                   e.g. P3=(B,C3,H/8,W/8), P4=(B,C4,H/16,W/16), P5=(B,C5,H/32,W/32)
+            img  : raw NIR image       — (B, 1, H, W)
+
+        Returns:
+            Attended feature map       — (B, C, H', W')   same shape as feat
+
+        Shape trace (example: img=640×640, P3 feat=80×80):
+          img     : (B, 1, 640, 640)
+          e_mag   : (B, N, 640, 640)   — compute_edge_magnitude
+          e_ds    : (B, N, 80, 80)     — adaptive pool to feature-map size
+          a_raw   : (B, 1, 80, 80)     — 1×1 projection
+          attn    : (B, 1, 80, 80)     — sigmoid → [0, 1]
+          out     : (B, C, 80, 80)     — feat * attn  [or residual form]
+
+        Note: this convenience path recomputes the edge magnitude from ``img``
+        on every call.  When applying EAA at multiple scales of the SAME image
+        (e.g. P3/P4/P5 in model.py), call ``compute_edge_magnitude(img)`` once
+        and then ``apply_to(feat, e_mag)`` per scale to avoid re-running the
+        full-resolution edge convolution.
+        """
+        e_mag = self.compute_edge_magnitude(img)
+        return self.apply_to(feat, e_mag)
 
 
 # ---------------------------------------------------------------------------

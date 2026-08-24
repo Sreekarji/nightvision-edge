@@ -45,14 +45,15 @@ def fail(msg: str) -> None:
 # Test 1 — Load test
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_load(root: Path, split: str = "train") -> NIRDetDataset:
+def test_load(root: Path, split: str = "train",
+              img_h: int = 384, img_w: int = 640) -> NIRDetDataset:
     """
     Load the entire split without errors.
     Print: total images, total annotations, images with zero annotations.
     """
     header("Test 1 — Load test")
 
-    ds = NIRDetDataset(root, split=split, img_size=640, augment=False)
+    ds = NIRDetDataset(root, split=split, img_h=img_h, img_w=img_w, augment=False)
     total_images = len(ds)
     total_annotations = 0
     zero_annotation_images = 0
@@ -89,14 +90,15 @@ def test_load(root: Path, split: str = "train") -> NIRDetDataset:
 # Test 2 — Shape test
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_shapes(root: Path, split: str = "train", img_size: int = 640) -> None:
+def test_shapes(root: Path, split: str = "train",
+                img_h: int = 384, img_w: int = 640) -> None:
     """
     Single item: image shape == (1, H, W); labels shape == (N, 5).
     Batched:     images shape == (B, 1, H, W).
     """
     header("Test 2 — Shape test")
 
-    ds = NIRDetDataset(root, split=split, img_size=img_size, augment=False)
+    ds = NIRDetDataset(root, split=split, img_h=img_h, img_w=img_w, augment=False)
     B = min(4, len(ds))
 
     # --- Single item ---
@@ -104,8 +106,8 @@ def test_shapes(root: Path, split: str = "train", img_size: int = 640) -> None:
     assert img.ndim == 3, f"Expected 3-D tensor, got {img.ndim}-D"
     C, H, W = img.shape
     assert C == 1, f"Expected 1 channel, got {C}"
-    assert H == img_size and W == img_size, (
-        f"Expected ({img_size},{img_size}), got ({H},{W})"
+    assert H == img_h and W == img_w, (
+        f"Expected ({img_h},{img_w}), got ({H},{W})"
     )
     assert labels.ndim == 2, f"Labels must be 2-D, got {labels.ndim}-D"
     assert labels.shape[1] == 5, (
@@ -117,8 +119,8 @@ def test_shapes(root: Path, split: str = "train", img_size: int = 640) -> None:
     loader = DataLoader(ds, batch_size=B, shuffle=False, collate_fn=collate_fn)
     batch_imgs, batch_labels = next(iter(loader))
 
-    assert batch_imgs.shape == (B, 1, img_size, img_size), (
-        f"Batched images: expected ({B},1,{img_size},{img_size}), "
+    assert batch_imgs.shape == (B, 1, img_h, img_w), (
+        f"Batched images: expected ({B},1,{img_h},{img_w}), "
         f"got {tuple(batch_imgs.shape)}"
     )
     assert isinstance(batch_labels, list) and len(batch_labels) == B, (
@@ -136,11 +138,13 @@ def test_shapes(root: Path, split: str = "train", img_size: int = 640) -> None:
 # Test 3 — Normalisation test
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_normalisation(root: Path, split: str = "train", n_samples: int = 20) -> None:
+def test_normalisation(root: Path, split: str = "train",
+                       img_h: int = 384, img_w: int = 640,
+                       n_samples: int = 20) -> None:
     """All pixel values must be in [0, 1]."""
     header("Test 3 — Normalisation test")
 
-    ds = NIRDetDataset(root, split=split, img_size=640, augment=False)
+    ds = NIRDetDataset(root, split=split, img_h=img_h, img_w=img_w, augment=False)
     n_samples = min(n_samples, len(ds))
 
     for idx in range(n_samples):
@@ -162,6 +166,8 @@ def test_normalisation(root: Path, split: str = "train", n_samples: int = 20) ->
 def test_augmentation(
     root: Path,
     split: str = "train",
+    img_h: int = 384,
+    img_w: int = 640,
     n_versions: int = 10,
     debug_path: str = "debug_aug.jpg",
 ) -> None:
@@ -173,12 +179,13 @@ def test_augmentation(
     """
     header("Test 4 — Augmentation sanity test")
 
-    ds = NIRDetDataset(root, split=split, img_size=640, augment=True)
+    ds = NIRDetDataset(root, split=split, img_h=img_h, img_w=img_w, augment=True)
 
     # Find the first image that has at least one annotation.
     seed_idx = None
     for i in range(len(ds)):
-        _, lbl = NIRDetDataset(root, split=split, img_size=640, augment=False)[i]
+        _, lbl = NIRDetDataset(root, split=split, img_h=img_h, img_w=img_w,
+                               augment=False)[i]
         if lbl.shape[0] > 0:
             seed_idx = i
             break
@@ -258,7 +265,10 @@ def main():
         help="Path to miniNIRPed root (contains images/ and labels/)",
     )
     parser.add_argument("--split", default="train", help="Which split to test")
-    parser.add_argument("--img-size", type=int, default=640)
+    parser.add_argument("--img-h", type=int, default=384,
+                        help="Resize height (pipeline default 384)")
+    parser.add_argument("--img-w", type=int, default=640,
+                        help="Resize width (pipeline default 640)")
     parser.add_argument("--debug-path", default="debug_aug.jpg")
     args = parser.parse_args()
 
@@ -269,12 +279,13 @@ def main():
     print(f"\nNIRDet Dataset Tests")
     print(f"  root   : {root}")
     print(f"  split  : {args.split}")
-    print(f"  imgsize: {args.img_size}")
+    print(f"  img    : {args.img_h} x {args.img_w}")
 
-    test_load(root, split=args.split)
-    test_shapes(root, split=args.split, img_size=args.img_size)
-    test_normalisation(root, split=args.split)
-    test_augmentation(root, split=args.split, debug_path=args.debug_path)
+    test_load(root, split=args.split, img_h=args.img_h, img_w=args.img_w)
+    test_shapes(root, split=args.split, img_h=args.img_h, img_w=args.img_w)
+    test_normalisation(root, split=args.split, img_h=args.img_h, img_w=args.img_w)
+    test_augmentation(root, split=args.split, img_h=args.img_h, img_w=args.img_w,
+                      debug_path=args.debug_path)
 
     print("\n" + "=" * 60)
     print("  All tests passed.")

@@ -87,6 +87,7 @@ NUM_WORKERS   = 0                         # 0 = safest on Windows; raise if CPU 
 # Output directory (auto-created)
 EVAL_OUT_DIR  = Path("eval_outputs")
 HARD_DIR      = EVAL_OUT_DIR / "hard_cases"
+PRED_DIR      = EVAL_OUT_DIR / "predictions"
 
 # mAP reference from Phase 8
 BASELINE_MAP50 = 0.7350    # YOLO11n fine-tuned on miniNIRPed (Phase 8 result)
@@ -703,6 +704,61 @@ def visualise_hard_cases(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# STEP 6b  —  ALL PREDICTIONS VISUALISATION
+# ═════════════════════════════════════════════════════════════════════════════
+
+def save_all_predictions(
+    val_ds:  NIRDetDataset,
+    preds:   List[Dict],
+    targets: List[Dict],
+    names:   List[str],
+    out_dir: Path,
+    score_thresh: float,
+) -> int:
+    """
+    Save one annotated image per val image: GT (green) + predictions (red,
+    with confidence label), filtered at the deployment score threshold.
+
+    Unlike visualise_hard_cases() — which saves only pure false negatives —
+    this saves EVERY val image so the full detection pattern can be eyeballed
+    (hits, misses, weak detections, and false positives in one folder).
+
+    preds[i]["scores"] are the cached confidence values from the 0.05-threshold
+    inference pass; we post-filter at score_thresh (deployment 0.25) here so
+    the drawn boxes match what the deployment threshold would actually show.
+
+    Images are re-read via val_ds[i] for the float tensor.
+    val_ds uses augment=False → deterministic LongestMaxSize+PadIfNeeded transform,
+    so pixel coordinates of preds[i]["boxes"] are in the correct frame.
+
+    Returns the number of images saved.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    saved = 0
+    for i in range(len(val_ds)):
+        image_chw, _ = val_ds[i]           # re-read: (1,H,W) float, deterministic
+
+        # Deployment filter: only draw predictions above score_thresh
+        keep       = preds[i]["scores"] >= score_thresh
+        p_boxes    = preds[i]["boxes"][keep]     # (K, 4) xyxy px
+        p_scores   = preds[i]["scores"][keep]    # (K,)
+
+        vis = render_case(
+            image_chw,
+            targets[i]["boxes"],           # (M,4) GT xyxy px — cached from inference
+            p_boxes,                       # (K,4) filtered preds
+            p_scores,                      # (K,)  confidence values
+        )
+        path = out_dir / names[i]          # original filename, e.g. img_042.jpg
+        cv2.imwrite(str(path), vis)
+        saved += 1
+
+    print(f"  Saved {saved} prediction image(s) → {out_dir}/")
+    return saved
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # STEP 7  —  LATENCY BENCHMARK
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -874,8 +930,25 @@ def main(args: argparse.Namespace) -> int:
     delta = map50 - BASELINE_MAP50
 
     # mAP50-95: same cached preds, different IoU thresholds — no model re-run
-    res5095, _ = compute_map(preds, targets, iou_thresholds=COCO_IOU_THRESHOLDS)
-    map5095 = float(res5095["map"])
+    # FIX: pass extended_summary=True so the precision tensor (T,R,K,A,M) is
+    # available. res5095["map"] averages across COCO area buckets (all/small/
+    # medium/large), NOT across IoU thresholds. When map_small and map_large
+    # are -1 (no pedestrians of those COCO sizes in the val set), the
+    # area-mean collapses to -1 — a sentinel, not a real metric.
+    # Correct mAP50-95 = mean of per-threshold APs over T=10 IoU thresholds,
+    # read from precision[t, :, 0, 0, -1] (area=all, maxdet=300).
+    res5095, metric5095 = compute_map(preds, targets,
+                                      iou_thresholds=COCO_IOU_THRESHOLDS,
+                                      extended_summary=True)
+    # Compute correct mAP50-95 from precision tensor (T, R, K, A, M)
+    prec_tensor = res5095["precision"]   # (T, R, K, A, M)
+    aps_per_iou = []
+    for t in range(len(COCO_IOU_THRESHOLDS)):
+        prec_R = prec_tensor[t, :, 0, 0, -1]   # (R,) area=all, maxdet=300
+        valid = prec_R >= 0                      # mask COCO -1 sentinel
+        ap = float(prec_R[valid].mean()) if valid.any() else 0.0
+        aps_per_iou.append(ap)
+    map5095 = sum(aps_per_iou) / len(aps_per_iou)
 
     # Per-size metrics (-1.0 = no objects of that COCO size exist in val set)
     map_s  = float(res5095.get("map_small",  torch.tensor(-1.0)))
@@ -963,6 +1036,22 @@ def main(args: argparse.Namespace) -> int:
         print(f"     {nm}")
     if not saved:
         print("     (none — model has ≥1 prediction on every annotated image)")
+    print()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Step 6b — All-predictions visualisation
+    # ─────────────────────────────────────────────────────────────────────────
+    print("=" * 62)
+    print("  Step 6b — All-predictions visualisation")
+    print("=" * 62)
+    save_all_predictions(
+        val_ds,
+        preds,
+        targets,
+        names,
+        PRED_DIR,
+        score_thresh=args.score_thresh,
+    )
     print()
 
     # ─────────────────────────────────────────────────────────────────────────

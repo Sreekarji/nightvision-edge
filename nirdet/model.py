@@ -340,6 +340,14 @@ class NIRDet(nn.Module):
         # We re-run the backbone stage-by-stage to insert EAA after each stage.
         # This mirrors the forward pass described in backbone.py but with EAA
         # inserted between stages rather than calling backbone.forward() directly.
+        #
+        # FIX: the full-resolution edge convolution runs ONCE per image.
+        #   Previously each self.eaa(...) call re-ran edge_conv on the full H×W
+        #   image (4× per forward).  compute_edge_magnitude() returns the shared
+        #   (B,N,H,W) magnitude map; apply_to() pools it per scale.
+
+        # Compute the edge magnitude map once — (B, N, H, W)
+        e_mag = self.eaa.compute_edge_magnitude(x)
 
         # Stem: (B,1,H,W) → (B,32,H/2,W/2)
         feat = self.backbone.stem(x)
@@ -347,22 +355,22 @@ class NIRDet(nn.Module):
         # Stage 1: → (B,64,H/4,W/4)
         feat = self.backbone.down1(feat)      # (B,64,H/4,W/4)
         feat = self.backbone.stage1(feat)     # (B,64,H/4,W/4)
-        feat = self.eaa(feat, x)              # (B,64,H/4,W/4)
+        feat = self.eaa.apply_to(feat, e_mag) # (B,64,H/4,W/4)
 
         # Stage 2 → P3: → (B,128,H/8,W/8)
         feat = self.backbone.down2(feat)      # (B,128,H/8,W/8)
         P3   = self.backbone.stage2(feat)     # (B,128,H/8,W/8)
-        P3   = self.eaa(P3, x)               # (B,128,H/8,W/8)
+        P3   = self.eaa.apply_to(P3, e_mag)  # (B,128,H/8,W/8)
 
         # Stage 3 → P4: → (B,256,H/16,W/16)
         feat = self.backbone.down3(P3)        # (B,256,H/16,W/16)
         P4   = self.backbone.stage3(feat)     # (B,256,H/16,W/16)
-        P4   = self.eaa(P4, x)               # (B,256,H/16,W/16)
+        P4   = self.eaa.apply_to(P4, e_mag)  # (B,256,H/16,W/16)
 
         # Stage 4 → P5: → (B,256,H/32,W/32)
         feat = self.backbone.down4(P4)        # (B,256,H/32,W/32)
         P5   = self.backbone.stage4(feat)     # (B,256,H/32,W/32)
-        P5   = self.eaa(P5, x)               # (B,256,H/32,W/32)
+        P5   = self.eaa.apply_to(P5, e_mag)  # (B,256,H/32,W/32)
 
         # ── 2. Neck ───────────────────────────────────────────────────────────
         # P3/P4/P5 → N3/N4/N5, all (B,256,H/stride,W/stride)

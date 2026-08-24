@@ -24,3 +24,5 @@ yolo11n.pt
 nirdet/checkpoints/
 nirdet/eval_outputs/hard_cases/
 nirdet/debug_aug.jpg
+nirdet/eval_outputs/predictions/
+.pytest_cache/
