@@ -224,11 +224,8 @@ class LightweightFPN(nn.Module):
         # td5_up: (B, OUT=256, H/16, W/16)   [H/32 × 2 = H/16, same for W]
         td5_up: torch.Tensor = F.interpolate(
             td5,
-            scale_factor=2,
+            size=l4.shape[-2:],
             mode="nearest",
-            # recompute_scale_factor=False avoids a deprecation warning in
-            # PyTorch ≥ 1.11 when scale_factor is an integer.
-            recompute_scale_factor=False,
         )
 
         # Element-wise addition merges semantic context from P5 with
@@ -240,9 +237,8 @@ class LightweightFPN(nn.Module):
         # td4_up: (B, OUT=256, H/8, W/8)
         td4_up: torch.Tensor = F.interpolate(
             td4,
-            scale_factor=2,
+            size=l3.shape[-2:],
             mode="nearest",
-            recompute_scale_factor=False,
         )
 
         # Element-wise addition merges semantic context (now from both P5 and P4)

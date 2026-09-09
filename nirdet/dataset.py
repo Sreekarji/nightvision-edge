@@ -81,6 +81,17 @@ def build_train_transforms(img_h: int = 384, img_w: int = 640) -> A.Compose:
     return A.Compose(
         [
             # --- Geometric (bbox-aware) ---
+            # FIX: crop/scale happens BEFORE the letterbox (LongestMaxSize +
+            # PadIfNeeded), not after. Cropping after padding crops into the
+            # black pad border / rescaled content, corrupting box coords.
+            A.RandomResizedCrop(
+                size=(img_h, img_w),
+                scale=(0.8, 1.0),
+                ratio=(1.2, 2.2),   # recentred on W/H = 640/384 = 1.667; the square
+                                    # default (0.75, 1.33) squashes box w/h toward 1.0
+                                    # at a non-square target (measured +9.5% + dropout)
+                p=0.5,
+            ),
             A.LongestMaxSize(max_size=max(img_h, img_w), p=1.0),
             A.PadIfNeeded(
                 min_height=img_h,
@@ -90,14 +101,6 @@ def build_train_transforms(img_h: int = 384, img_w: int = 640) -> A.Compose:
                 p=1.0,
             ),
             A.HorizontalFlip(p=0.5),
-            A.RandomResizedCrop(
-                size=(img_h, img_w),
-                scale=(0.8, 1.0),
-                ratio=(1.2, 2.2),   # recentred on W/H = 640/384 = 1.667; the square
-                                    # default (0.75, 1.33) squashes box w/h toward 1.0
-                                    # at a non-square target (measured +9.5% + dropout)
-                p=0.5,
-            ),
             # --- Photometric (image only, bbox unchanged) ---
             A.RandomBrightnessContrast(
                 brightness_limit=0.3,
@@ -105,12 +108,14 @@ def build_train_transforms(img_h: int = 384, img_w: int = 640) -> A.Compose:
                 p=0.5,
             ),
             A.GaussNoise(std_range=(0.01, 0.05), p=0.3),
+            # FIX: shrink holes 16-48 → 8-16 px and p 0.2 → 0.1. 48 px holes at
+            # 384×640 can fully erase a small pedestrian (~30-50 px tall).
             A.CoarseDropout(
                 num_holes_range=(1, 4),
-                hole_height_range=(16, 48),
-                hole_width_range=(16, 48),
+                hole_height_range=(8, 16),
+                hole_width_range=(8, 16),
                 fill=0,
-                p=0.2,
+                p=0.1,
             ),
         ],
         bbox_params=A.BboxParams(

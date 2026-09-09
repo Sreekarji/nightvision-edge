@@ -29,6 +29,10 @@ import logging
 from pathlib import Path
 from copy import deepcopy
 
+import csv
+import random
+import numpy as np
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
@@ -62,10 +66,13 @@ CFG = {
     "num_classes": 1,           # single class: person
 
     # ── Training schedule ────────────────────────────────────────────────────
-    "epochs":        100,       # total training epochs
-    "warmup_epochs": 5,         # linear LR warmup from lr_start → lr_peak
+    "epochs":        100,       # Keep at 100 — enough to prove the architecture on miniNIRPed without
+                                # overfitting. Real production training on larger datasets will use more.
+    "warmup_steps":  300,       # Step-based warmup: dataset-size invariant.
+                                # At 261 images batch=8: 300 steps ≈ 9 epochs of warmup.
+                                # At 10,000 images batch=8: still 300 steps ≈ 0.2 epochs — auto-scales.
     "lr_peak":       1e-3,      # peak LR after warmup (cosine decays to lr_min)
-    "lr_start":      1e-5,      # LR at epoch 0 (start of warmup)
+    "lr_start":      1e-5,      # LR at step 0 (start of warmup)
     "lr_min":        1e-6,      # final LR at end of cosine decay
     "weight_decay":  5e-4,
     "momentum":      0.937,     # SGD momentum (ignored if using Adam)
@@ -90,43 +97,58 @@ CFG = {
                                 # tighten to 5 if NaN appears on epoch 1
 
     # ── Validation / checkpointing ───────────────────────────────────────────
-    "val_interval":  5,         # run mAP50 eval every N epochs
+    "val_interval":  5,         # Evaluate every 5 epochs for epochs 1-75.
+                                # Dense eval (every epoch) for final 25 epochs — catches the exact peak.
     "save_last":     True,      # always save last.pth after each epoch
 
     # ── Early stopping (mAP50-based, in eval intervals) ──────────────────────
-    "es_patience":   4,         # stop after 4 consecutive evals (= 20 epochs)
-                                # with no mAP50 improvement
-    "es_min_delta":  1e-4,      # improvement threshold (absolute mAP50 units)
+    "es_enabled":   False,      # Disabled: at 261 images val mAP standard error is ~±0.02.
+                                # Early stopping on noisy val signal killed the previous run at epoch 80
+                                # before the cosine schedule finished. Let it run all 100 epochs and
+                                # pick best.pth. Re-enable with True when dataset > 2000 images.
 
     # ── Baseline to beat ─────────────────────────────────────────────────────
     "baseline_map50": 0.735,    # YOLO11n fine-tuned reference
+
+    # ── Deployment ───────────────────────────────────────────────────────────
+    "deploy_score_thresh": 0.301,  # F1-optimal threshold measured from evaluate.py PR curve.
+                                   # Re-derive after Group I training (QFL shifts score distribution).
+
+    # ── EMA (exponential moving average of weights) ──────────────────────────
+    "use_ema":      True,
+    "ema_decay":    0.995,
+    "ema_tau_steps": 160,    # ≈ 5 epochs at 32 steps/epoch on miniNIRPed
 }
 
 # ════════════════════════════════════════════════════════════════════════════
 # LEARNING-RATE SCHEDULE
 # ════════════════════════════════════════════════════════════════════════════
 
-def get_lr(epoch: int, cfg: dict) -> float:
+def get_lr(step: int, steps_per_epoch: int, cfg: dict) -> float:
     """
-    Returns the LR multiplier (× lr_peak) for a given epoch.
+    Step-based LR schedule — dataset-size invariant.
 
-    Epochs [0, warmup_epochs):   linear ramp  lr_start → lr_peak
-    Epochs [warmup_epochs, end]: cosine decay lr_peak  → lr_min
+    Warmup is in STEPS not epochs:
+      300 steps at 261 images (batch=8) = ~9 epochs
+      300 steps at 10,000 images (batch=8) = ~0.2 epochs
+    Both give the same number of gradient steps of warmup.
+
+    Phases:
+      [0, warmup_steps):           linear ramp lr_start → lr_peak
+      [warmup_steps, total_steps]: cosine decay lr_peak → lr_min
     """
-    warmup = cfg["warmup_epochs"]
-    total  = cfg["epochs"]
-    peak   = cfg["lr_peak"]
-    start  = cfg["lr_start"]
-    min_lr = cfg["lr_min"]
+    total_steps = cfg["epochs"] * steps_per_epoch
+    warm        = cfg["warmup_steps"]
+    peak        = cfg["lr_peak"]
+    start       = cfg["lr_start"]
+    min_lr      = cfg["lr_min"]
 
-    if warmup > 0 and epoch < warmup:
-        # Linear warmup: fraction of the way from start to peak
-        frac = epoch / max(warmup - 1, 1)
+    if step < warm:
+        frac = step / max(warm - 1, 1)
         return start + frac * (peak - start)
     else:
-        # Cosine annealing from peak to min_lr
-        progress = (epoch - warmup) / max(total - warmup - 1, 1)
-        cosine   = 0.5 * (1 + math.cos(math.pi * progress))
+        progress = (step - warm) / max(total_steps - warm, 1)
+        cosine   = 0.5 * (1.0 + math.cos(math.pi * progress))
         return min_lr + cosine * (peak - min_lr)
 
 
@@ -154,6 +176,58 @@ def build_param_groups(model: nn.Module, weight_decay: float) -> list:
         {"params": decay,    "weight_decay": weight_decay},
         {"params": no_decay, "weight_decay": 0.0},
     ]
+
+
+class ModelEMA:
+    """
+    Exponential Moving Average of model weights.
+
+    Decay constant is scaled to THIS project's run:
+      Total steps at 100 epochs, 261 images, batch=8: ~3,200 steps.
+      YOLOv5 d=0.9999 → tau=10,000 steps > entire run → EMA never converges.
+      Correct: d=0.995 → tau=200 steps ≈ 6 epochs → EMA converges in first
+      quarter of training and tracks the model usefully throughout.
+
+    Formula: d_eff(step) = d * (1 - exp(-step / tau))
+    Ramps from 0 at step 0 (EMA = live weights) to d at large steps.
+    Prevents EMA from being dominated by bad early weights.
+
+    BN buffers (running_mean/var) are COPIED not averaged — they are
+    already running statistics and averaging them biases variance down.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        decay: float = 0.995,
+        tau_steps: int = 160,    # ≈ 5 epochs at 32 steps/epoch
+    ):
+        self.ema     = deepcopy(model).eval()
+        self.decay   = decay
+        self.tau     = tau_steps
+        self.updates = 0
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        self.updates += 1
+        d   = self.decay * (1.0 - math.exp(-self.updates / self.tau))
+        msd = model.state_dict()
+        named_params = dict(self.ema.named_parameters())
+        for k, v in self.ema.state_dict().items():
+            if v.dtype.is_floating_point and k in named_params:
+                v.mul_(d).add_(msd[k].detach(), alpha=1.0 - d)
+            else:
+                v.copy_(msd[k])
+
+    def state_dict(self):
+        return {"ema": self.ema.state_dict(), "updates": self.updates}
+
+    def load_state_dict(self, sd):
+        self.ema.load_state_dict(sd["ema"])
+        self.updates = sd.get("updates", 0)
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # MIXED-PRECISION HELPERS
@@ -283,26 +357,30 @@ def save_checkpoint(
     scheduler_state: dict,
     best_map50: float,
     cfg: dict,
+    ema=None,
 ) -> None:
     ckpt = {
         "epoch":          epoch,
-        "model_state":    model.state_dict(),
+        "model_state":    (ema.ema.state_dict() if ema is not None else model.state_dict()),
         "optimizer_state": optimizer.state_dict(),
         "scaler_state":   scaler.state_dict(),
         "scheduler_state": scheduler_state,
         "best_map50":     best_map50,
         "cfg":            cfg,
+        "ema_state":      (ema.state_dict() if ema is not None else None),
     }
     torch.save(ckpt, path)
 
 
-def load_checkpoint(path: Path, model: nn.Module, optimizer, scaler):
+def load_checkpoint(path: Path, model: nn.Module, optimizer, scaler, ema=None):
     """Load checkpoint and return (start_epoch, best_map50, scheduler_state)."""
     log.info(f"Resuming from {path}")
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt["model_state"])
     optimizer.load_state_dict(ckpt["optimizer_state"])
     scaler.load_state_dict(ckpt["scaler_state"])
+    if ema is not None and ckpt.get("ema_state"):
+        ema.load_state_dict(ckpt["ema_state"])
     return (
         ckpt["epoch"] + 1,
         ckpt.get("best_map50", 0.0),
@@ -323,10 +401,13 @@ def train_one_epoch(
     device:     torch.device,
     epoch:      int,
     cfg:        dict,
-) -> dict:
+    global_step: int,
+    steps_per_epoch: int,
+    ema=None,
+) -> tuple[dict, int]:
     """
     Runs one full epoch of training.
-    Returns dict of mean losses: {total, cls, reg, conf}.
+    Returns (mean_losses_dict, updated_global_step).
     """
     model.train()
     total_loss = cls_loss = reg_loss = conf_loss = 0.0
@@ -335,6 +416,10 @@ def train_one_epoch(
     pbar = tqdm(loader, desc=f"Epoch {epoch+1:03d}", leave=True, dynamic_ncols=True)
 
     for batch_idx, (images, targets) in enumerate(pbar):
+        # ── Step-wise LR schedule (dataset-size invariant) ───────────────────
+        lr = get_lr(global_step, steps_per_epoch, cfg)
+        set_lr(optimizer, lr)
+        global_step += 1
         # ── Move to device ───────────────────────────────────────────────────
         # collate_fn already stacks images to (B,1,H,W) — just move to device
         images = images.to(device, non_blocking=True)
@@ -388,6 +473,10 @@ def train_one_epoch(
         scaler.step(optimizer)
         scaler.update()
 
+        # ── EMA update after the optimizer step ──────────────────────────────
+        if ema is not None:
+            ema.update(model)
+
         # ── Accumulate losses for logging ────────────────────────────────────
         total_loss += losses["total"].item()
         cls_loss   += losses.get("cls",  losses["total"]).item()
@@ -408,31 +497,36 @@ def train_one_epoch(
         "cls":   cls_loss   / n_batches,
         "reg":   reg_loss   / n_batches,
         "conf":  conf_loss  / n_batches,
-    }
+    }, global_step
 
 # ════════════════════════════════════════════════════════════════════════════
 # MAIN TRAINING LOOP
 # ════════════════════════════════════════════════════════════════════════════
 
 def main(args):
+    # ── Deterministic seeding ────────────────────────────────────────────────
+    random.seed(42); np.random.seed(42)
+    torch.manual_seed(42); torch.cuda.manual_seed_all(42)
+    torch.backends.cudnn.benchmark = True
+
     cfg = deepcopy(CFG)
 
     # ── Override config for smoke / overfit tests ─────────────────────────────
     if args.smoke_test:
         cfg["epochs"]       = 5
         cfg["val_interval"] = 5   # eval once at the end
-        cfg["es_patience"]  = 999  # disable early stopping
+        cfg["es_enabled"]   = False  # early stopping off for smoke test
         log.info("=== SMOKE TEST MODE: 5 epochs, 10 images ===")
 
     if args.overfit_test:
       cfg["epochs"]        = 300
-      cfg["warmup_epochs"] = 0
+      cfg["warmup_steps"]  = 0
       cfg["lr_peak"]       = 1e-3
       cfg["lr_start"]      = 1e-3
       cfg["lr_min"]        = 1e-3    # flat LR — cosine decay masks real plateaus
       cfg["batch_size"]    = 2       # 5 steps/epoch × 300 = 1500 gradient steps
       cfg["val_interval"]  = 50
-      cfg["es_patience"]   = 999
+      cfg["es_enabled"]    = False
       log.info("=== OVERFIT TEST MODE: 300 epochs, batch=2, flat LR ===")
 
     # ── Device ───────────────────────────────────────────────────────────────
@@ -508,6 +602,12 @@ def main(args):
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info(f"Trainable parameters: {n_params:,}")
 
+    # ── EMA shadow model ─────────────────────────────────────────────────────
+    # Must be created BEFORE load_checkpoint() so a resumed run restores the
+    # EMA state along with the live weights.
+    ema = ModelEMA(model, decay=cfg["ema_decay"], tau_steps=cfg["ema_tau_steps"]) \
+          if cfg.get("use_ema", True) else None
+
     # ── Loss ──────────────────────────────────────────────────────────────────
     # Grid sizes derive from (img_h, img_w) ÷ strides (8,16,32):
     #   e.g. 384×640 → ((48,80), (24,40), (12,20)).
@@ -516,7 +616,16 @@ def main(args):
     grid_sizes = tuple(
         (cfg["img_h"] // s, cfg["img_w"] // s) for s in (8, 16, 32)
     )
-    criterion = NIRDetLoss(grid_sizes=grid_sizes, lambda_cls=1.0, lambda_reg=5.0).to(device)
+    criterion = NIRDetLoss(
+        grid_sizes=grid_sizes,
+        lambda_cls=1.0,
+        lambda_reg=2.0,
+        quality_target=True,
+        qfl_ramp_frac=0.20,       # ramp over first 20 epochs of 100
+        total_epochs=cfg["epochs"],
+        img_h=cfg["img_h"],
+        img_w=cfg["img_w"],
+    ).to(device)
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
     # FIX: split params into decay/no-decay groups (biases + 1D BN/GN params
@@ -548,7 +657,7 @@ def main(args):
         resume_path = Path(args.resume)
         if resume_path.exists():
             start_epoch, best_map50, _ = load_checkpoint(
-                resume_path, model, optimizer, scaler
+                resume_path, model, optimizer, scaler, ema
             )
             log.info(f"Resumed from epoch {start_epoch}, best mAP50 = {best_map50:.4f}")
         else:
@@ -562,24 +671,32 @@ def main(args):
 
     epoch_times = []
 
-    for epoch in range(start_epoch, cfg["epochs"]):
+    # ── Global step counter for step-wise LR schedule ─────────────────────────
+    global_step = 0
+    steps_per_epoch = max(1, len(train_loader))
 
-        # ── Set LR for this epoch ─────────────────────────────────────────────
-        lr = get_lr(epoch, cfg)
-        set_lr(optimizer, lr)
+    for epoch in range(start_epoch, cfg["epochs"]):
 
         # ── Step EAA freeze schedule ──────────────────────────────────────────
         model.step_eaa_epoch()
 
-        # ── Train one epoch ───────────────────────────────────────────────────
+        # ── QFL ramp schedule (epoch → soft IoU confidence targets) ──────────
+        criterion.set_epoch(epoch)
+
+        # ── Train one epoch (LR updated per-step inside) ──────────────────────
         t0     = time.perf_counter()
-        losses = train_one_epoch(
+        losses, global_step = train_one_epoch(
             model, criterion, train_loader,
             optimizer, scaler, amp_ctx, device, epoch, cfg,
+            global_step, steps_per_epoch,
+            ema,
         )
         t1     = time.perf_counter()
         elapsed = t1 - t0
         epoch_times.append(elapsed)
+
+        # ── LR at the last training step of this epoch (for logging) ──────────
+        lr = get_lr(max(global_step - 1, 0), steps_per_epoch, cfg)
 
         # ── Print per-epoch stats ─────────────────────────────────────────────
         log.info(
@@ -609,54 +726,69 @@ def main(args):
                 epoch, model, optimizer, scaler,
                 {},     # scheduler_state (we compute lr on the fly)
                 best_map50, cfg,
+                ema,
             )
 
         # ── Validation mAP50 ─────────────────────────────────────────────────
-        # Evaluate on: every val_interval epochs, AND on the final epoch
+        # Evaluate every val_interval epochs for epochs 1-75; every epoch for
+        # the final 25 epochs (dense eval catches the exact cosine-decay peak).
         is_last_epoch = (epoch + 1 == cfg["epochs"])
-        if ((epoch + 1) % cfg["val_interval"] == 0) or is_last_epoch:
+        is_late = (epoch + 1) > int(0.75 * cfg["epochs"])  # final 25 epochs
+        interval = 1 if is_late else cfg["val_interval"]
+        if ((epoch + 1) % interval == 0) or is_last_epoch:
 
             log.info(f"  [Eval] Running mAP50 on {len(val_ds)} val images …")
-            map50 = evaluate_map50(model, val_loader, device, amp_ctx)
+            eval_model = ema.ema if ema is not None else model
+            map50 = evaluate_map50(eval_model, val_loader, device, amp_ctx)
             log.info(
                 f"  [Eval] mAP50 = {map50:.4f} "
                 f"(best = {best_map50:.4f}, baseline = {cfg['baseline_map50']:.4f})"
             )
 
+            # ── Per-epoch CSV history (append one row after every eval) ──────
+            hist_path = ckpt_dir / "history.csv"
+            write_header = not hist_path.exists()
+            with open(hist_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                if write_header:
+                    writer.writerow(["epoch", "lr", "total", "cls", "reg", "conf", "map50", "seconds"])
+                writer.writerow([
+                    epoch + 1,
+                    f"{lr:.6e}",
+                    f"{losses['total']:.6f}",
+                    f"{losses['cls']:.6f}",
+                    f"{losses['reg']:.6f}",
+                    f"{losses['conf']:.6f}",
+                    f"{map50:.6f}",
+                    f"{elapsed:.2f}",
+                ])
+
             # ── Best checkpoint ───────────────────────────────────────────────
-            # FIX: don't start the early-stop counter until mAP50 has cleared a
-            # warmup floor — before that, "no improvement over 0.0" is meaningless
-            # and would kill the run before confidence logits have risen.
-            ES_WARMUP_FLOOR = 1e-3
-            if map50 > best_map50 + cfg["es_min_delta"]:
+            if map50 > best_map50 + 0.005:
                 best_map50 = map50
                 es_counter = 0
                 save_checkpoint(
                     ckpt_dir / "best.pth",
                     epoch, model, optimizer, scaler,
                     {}, best_map50, cfg,
+                    ema,
                 )
                 beat_flag = "  ✓ BEATS BASELINE" if map50 >= cfg["baseline_map50"] else ""
                 log.info(
                     f"  [Checkpoint] New best mAP50 = {best_map50:.4f} saved.{beat_flag}"
                 )
-            elif best_map50 > ES_WARMUP_FLOOR:
-                es_counter += 1   # FIX: only count non-improvement once mAP50 has left ~0
-                log.info(
-                    f"  [EarlyStopping] No improvement "
-                    f"({es_counter}/{cfg['es_patience']} patience evals used)."
-                )
-            else:
-                log.info("  [EarlyStopping] mAP50 still ~0 — patience counter not started yet.")
 
-            # ── Early stopping check ──────────────────────────────────────────
-            if best_map50 > ES_WARMUP_FLOOR and es_counter >= cfg["es_patience"]:
-                log.info(
-                    f"  [EarlyStopping] Patience exhausted after "
-                    f"{es_counter * cfg['val_interval']} epochs without "
-                    f"mAP50 improvement. Stopping."
-                )
-                break
+            # ── Early stopping ────────────────────────────────────────────────
+            # es_enabled=False: runs all 100 epochs, relies on best.pth.
+            if cfg.get("es_enabled", False):
+                if map50 > best_map50 + 0.005:
+                    es_counter = 0
+                else:
+                    es_counter += 1
+                    log.info(f"  [EarlyStopping] No improvement ({es_counter} eval(s)).")
+                if es_counter >= cfg.get("es_patience", 8):
+                    log.info(f"  [EarlyStopping] Stopping at epoch {epoch+1}.")
+                    break
 
     # ── End of training ───────────────────────────────────────────────────────
     avg_epoch_time = sum(epoch_times) / max(len(epoch_times), 1)

@@ -183,6 +183,21 @@ class EdgeAwareAttention(nn.Module):
             self.proj.weight.abs_()   # all weights become non-negative
         nn.init.constant_(self.proj.bias, 0.0)
 
+        # ── Saturation fix ───────────────────────────────────────────────────
+        # After abs(Kaiming) init, proj.weight sums to ~2.4.
+        # Flat region: normalised edge magnitude = 1.0 per channel.
+        # a_raw = 2.4 × 1.0 + 0.0 (bias) = 2.4 → sigmoid = 0.92 everywhere.
+        # The module cannot suppress anything — attention is stuck near 1.0.
+        #
+        # Fix: normalise weights to sum=1 and set bias=-1.0.
+        # Flat region now: a_raw = 1.0 × 1.0 + (-1.0) = 0.0 → sigmoid = 0.5
+        # Edge region: normalised magnitude > 1.0 → a_raw > 0 → sigmoid > 0.5
+        # This gives a true dynamic range centred on 0.5 instead of 0.92.
+        with torch.no_grad():
+            weight_sum = self.proj.weight.sum().clamp(min=1e-6)
+            self.proj.weight.div_(weight_sum)
+            nn.init.constant_(self.proj.bias, -1.0)
+
     # ------------------------------------------------------------------ #
     #  Epoch control — call from training loop                             #
     # ------------------------------------------------------------------ #

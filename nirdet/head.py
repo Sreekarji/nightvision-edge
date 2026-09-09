@@ -28,6 +28,10 @@ from typing import List, Tuple
 import torch
 import torch.nn as nn
 
+from config import DECODE_OFFSET_SCALE
+_OFF_S = DECODE_OFFSET_SCALE
+_OFF_B = (DECODE_OFFSET_SCALE - 1.0) / 2.0
+
 
 def _init_conv_kaiming_normal(conv: nn.Conv2d, std: float = 0.01) -> None:
     """Match FCOS's own init convention: normal(std=0.01) weights, zero bias.
@@ -104,6 +108,12 @@ class PedestrianHead(nn.Module):
         self.cls_pred = nn.Conv2d(feat_channels, 1, kernel_size=1)  # -> 1 channel: person confidence logit
         self.reg_pred = nn.Conv2d(feat_channels, 4, kernel_size=1)  # -> 4 channels: (t_cx, t_cy, t_w, t_h)
 
+        # Per-level learnable regression scale (additive in log-space).
+        # Without this, exp(t_w)*W*stride = 640px at EVERY level even after
+        # scale routing — levels cannot specialise output magnitude.
+        # Init to 0: exp(0)=1, no change at init. Training adjusts.
+        self.reg_level_scale = nn.Parameter(torch.zeros(len(strides), 2))
+
         self._init_prediction_biases(prior_prob, prior_w, prior_h)
 
     def _init_prediction_biases(self, prior_prob: float, prior_w: float, prior_h: float) -> None:
@@ -170,7 +180,7 @@ class PedestrianHead(nn.Module):
         features = [N3, N4, N5]
         outputs: List[torch.Tensor] = []
 
-        for feat, stride in zip(features, self.strides):
+        for lvl, (feat, stride) in enumerate(zip(features, self.strides)):
             B, C, H, W = feat.shape  # e.g. (1, 256, 80, 80) for N3 at 640x640 input
 
             stem_out = self.stem(feat)  # (B, 256, H, W) -- 1x1 conv keeps spatial size
@@ -183,8 +193,8 @@ class PedestrianHead(nn.Module):
 
             t_cx = reg_raw[:, 0, :, :]  # (B, H, W)
             t_cy = reg_raw[:, 1, :, :]  # (B, H, W)
-            t_w  = reg_raw[:, 2, :, :]  # (B, H, W)
-            t_h  = reg_raw[:, 3, :, :]  # (B, H, W)
+            t_w  = reg_raw[:, 2, :, :] + self.reg_level_scale[lvl, 0]  # (B, H, W) -- level-scaled log-w
+            t_h  = reg_raw[:, 3, :, :] + self.reg_level_scale[lvl, 1]  # (B, H, W) -- level-scaled log-h
 
             if training_mode:
                 # Return raw logits — losses.py applies sigmoid/exp internally.
@@ -211,8 +221,9 @@ class PedestrianHead(nn.Module):
                 #   The +0.5 is removed: sigmoid(0)=0.5 already places the default
                 #   prediction at the cell centre; raw t_cx is unbounded and must NOT
                 #   be added directly (it can be ±5, blowing the center far outside the cell).
-                cx = (torch.sigmoid(t_cx) + grid_x) * stride  # (B, H, W) -- center x in pixels
-                cy = (torch.sigmoid(t_cy) + grid_y) * stride  # (B, H, W) -- center y in pixels
+                # MUST match losses._decode_pred_boxes exactly.
+                cx = (_OFF_S * torch.sigmoid(t_cx) - _OFF_B + grid_x) * stride  # (B, H, W) -- center x in pixels
+                cy = (_OFF_S * torch.sigmoid(t_cy) - _OFF_B + grid_y) * stride  # (B, H, W) -- center y in pixels
                 # FIX Bug5: losses.py decodes w_norm = exp(t_w) in [0,1] space;
                 #   to convert to pixels: w_px = w_norm * img_w_px, h_px = h_norm * img_h_px.
                 #   The original code used only * stride, giving w ~80x too small

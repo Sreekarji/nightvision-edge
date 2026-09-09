@@ -33,6 +33,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Tuple, Dict
 
+from config import DECODE_OFFSET_SCALE
+_OFF_S = DECODE_OFFSET_SCALE
+_OFF_B = (DECODE_OFFSET_SCALE - 1.0) / 2.0
+
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -69,159 +73,113 @@ def _box_cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
 
 class LabelAssigner:
     """
-    Center-cell label assignment.
+    Centre-cell + nearest-neighbour assignment with FPN scale routing.
 
-    Motivation and comparison
-    -------------------------
-    Four mainstream strategies exist:
+    Changes from original:
+    - Scale routing (Item 4): each GT is assigned ONLY to the FPN level
+      whose scale_ranges bracket contains max(w_px, h_px). Overlapping
+      ranges handle boundary objects.
+    - Neighbour assignment (Item 1, cross3): beyond the centre cell, the
+      two nearest neighbours in x and y are also assigned, subject to an
+      in-box guard. Triples regression signal. Fixes cell-boundary dead zone.
 
-    1. **FCOS-style** [FCOS 2019]: Every cell whose *center falls inside* the GT
-       box is labeled positive. Simple and well-studied but produces many
-       positive cells (hundreds for a large box) which increases gradient
-       variance with small datasets.
-
-    2. **SimOTA** [YOLOX 2021]: Formulates assignment as an optimal-transport
-       problem; each GT "supplies" k tokens distributed to the cheapest
-       (cls+IoU cost) prediction cells globally. Excellent on large-scale
-       benchmarks (COCO) but requires a warm-up cost matrix across all cells
-       which is slow and numerically brittle on tiny datasets where predictions
-       are random for many epochs.
-
-    3. **TOOD / Task-Aligned** [YOLOv6 ablation]: Selects top-k cells ranked by
-       p^α · IoU^β. Better than SimOTA in accuracy on larger models but adds
-       two extra hyperparameters and a dependency on meaningful classification
-       scores early in training, which is problematic for a cold-start detector.
-
-    4. **Center-cell** (chosen here): The single grid cell whose center is
-       closest to the GT box center is assigned positive. One positive per GT
-       box per scale.
-
-       Why chosen:
-       - Stable with small data: only 1–5 positive cells per image means the
-         gradient signal is maximally clean.
-       - No hyper-parameter tuning (SimOTA needs k, FCOS needs scale ranges).
-       - Correct and unambiguous: there is always exactly one responsible cell.
-       - Matches YOLOv1–v3 philosophy which proved effective for single-class
-         pedestrian detection long before OTA existed.
-       - SimOTA's global optimum advantage only materialises at COCO scale
-         (>100k images, 80 classes, dense crowds). For a limited NIR person
-         dataset it is overkill and a source of training instability.
-
-    Mathematical derivation
-    -----------------------
-    Given:
-        GT box g = (cx_g, cy_g, w_g, h_g) in normalized [0,1] coordinates.
-        A scale with S_h×S_w grid cells (e.g. (48, 80) at stride 8 for
-        640×384 input).
-
-    Step 1 — Map GT center to grid indices:
-        col = floor(cx_g · S_w)    ← column index ∈ [0, S_w)
-        row = floor(cy_g · S_h)    ← row index    ∈ [0, S_h)
-
-    Step 2 — Flatten to cell index:
-        cell_idx = row · S_w + col  ← scalar index into the (S_h·S_w) flat vector
-
-    Step 3 — Assign:
-        For the cell at (row, col), set:
-            conf_target = 1
-            box_target  = (cx_g, cy_g, w_g, h_g)   (absolute, normalized)
-
-        All other cells have conf_target = 0 and are background.
-
-    Step 4 — Multi-scale:
-        Repeat for each of the three scales independently. A person that is
-        very small will be assigned to the 48×80 scale's cell; a large person
-        to the 12×20 scale's cell. This is a simplification — YOLOv3 used
-        anchor matching to route GT boxes, but since we have no anchors we
-        assign the GT to ALL three scales simultaneously and let the
-        regression loss sort out which scale specialises. (A future upgrade
-        could add scale-routing by object size.)
+    Dataset-agnostic: scale_ranges defaults suit pedestrian data at 640x384.
+    Run tools/measure_priors.py on any new dataset to re-derive them.
     """
 
-    def __init__(self, grid_sizes: Tuple[Tuple[int, int], ...] = ((48, 80), (24, 40), (12, 20))):
-        """
-        Args:
-            grid_sizes: (S_h, S_w) spatial grid per scale, e.g.
-                        ((48, 80), (24, 40), (12, 20)) for 640×384 input.
-        """
-        self.grid_sizes = grid_sizes  # ((S_h, S_w), ...)
+    def __init__(
+        self,
+        grid_sizes: Tuple[Tuple[int, int], ...] = ((48, 80), (24, 40), (12, 20)),
+        strides: Tuple[int, ...] = (8, 16, 32),
+        scale_ranges: Tuple[Tuple[float, float], ...] = (
+            (0.0,   64.0),
+            (48.0,  160.0),
+            (128.0, 1e5),
+        ),
+        neighbour_mode: str = "cross3",
+    ):
+        assert len(grid_sizes) == len(strides) == len(scale_ranges)
+        assert neighbour_mode in ("center", "cross3")
+        self.grid_sizes     = grid_sizes
+        self.strides        = strides
+        self.scale_ranges   = scale_ranges
+        self.neighbour_mode = neighbour_mode
+        self.img_h = grid_sizes[0][0] * strides[0]
+        self.img_w = grid_sizes[0][1] * strides[0]
 
-    # ------------------------------------------------------------------
+    def _cells_for_gt(
+        self, cx: float, cy: float, w: float, h: float, S_h: int, S_w: int
+    ) -> list:
+        """Return flat cell indices assigned to one GT at one FPN level."""
+        fx, fy = cx * S_w, cy * S_h
+        col = min(int(fx), S_w - 1)
+        row = min(int(fy), S_h - 1)
+        u   = fx - col
+        v   = fy - row
+        cands = [(row, col)]
+
+        if self.neighbour_mode == "cross3":
+            dc = -1 if u < 0.5 else (1 if u > 0.5 else 0)
+            dr = -1 if v < 0.5 else (1 if v > 0.5 else 0)
+            if dc != 0:
+                cands.append((row, col + dc))
+            if dr != 0:
+                cands.append((row + dr, col))
+
+        half_w_cells = 0.5 * w * S_w
+        half_h_cells = 0.5 * h * S_h
+
+        out = []
+        for (r, c) in cands:
+            if not (0 <= r < S_h and 0 <= c < S_w):
+                continue
+            if (r, c) != (row, col):
+                if abs((c + 0.5) - fx) > half_w_cells:
+                    continue
+                if abs((r + 0.5) - fy) > half_h_cells:
+                    continue
+            out.append(r * S_w + c)
+        return out
+
     def assign(
         self,
-        gt_boxes: torch.Tensor,   # (N, 4) — cx, cy, w, h in [0,1]
+        gt_boxes: torch.Tensor,
         device: torch.device,
     ) -> List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         Build per-scale assignment targets for one image.
-
-        Args:
-            gt_boxes: (N, 4) tensor of GT boxes [cx, cy, w, h] ∈ [0,1].
-                      If N == 0, returns all-zero targets with no positives.
-            device:   Device to allocate tensors on.
-
-        Returns:
-            List of length len(self.grid_sizes). Each element is a tuple:
-                (conf_target, box_target, pos_mask)
-            where:
-                conf_target: (S_h*S_w,) float — 1.0 at positive cells, 0.0 elsewhere.
-                box_target:  (S_h*S_w, 4) float — GT box at positive cells, 0 elsewhere.
-                pos_mask:    (S_h*S_w,) bool   — True at cells that are positive.
+        Same return interface as original — callers unchanged.
         """
         results = []
+        n_gt = gt_boxes.shape[0]
 
-        for (S_h, S_w) in self.grid_sizes:
-            total_cells = S_h * S_w  # e.g. 3840 for (48, 80)
+        if n_gt > 0:
+            w_px = gt_boxes[:, 2] * self.img_w
+            h_px = gt_boxes[:, 3] * self.img_h
+            size = torch.maximum(w_px, h_px)
 
-            # Initialise targets as all-background.
-            # Shape: (S_h*S_w,) and (S_h*S_w, 4)
-            conf_target = torch.zeros(total_cells, dtype=torch.float32, device=device)
-            box_target  = torch.zeros(total_cells, 4, dtype=torch.float32, device=device)
+        for s, (S_h, S_w) in enumerate(self.grid_sizes):
+            total = S_h * S_w
+            conf_target = torch.zeros(total, dtype=torch.float32, device=device)
+            box_target  = torch.zeros(total, 4, dtype=torch.float32, device=device)
 
-            if gt_boxes.shape[0] == 0:
-                # No GT boxes → nothing to assign.
-                pos_mask = conf_target.bool()
-                results.append((conf_target, box_target, pos_mask))
+            if n_gt == 0:
+                results.append((conf_target, box_target, conf_target.bool()))
                 continue
 
-            # ----------------------------------------------------------
-            # Step 1: Map each GT center to grid indices.
-            #
-            #   col_idx = floor(cx_g * S_w)   ← clamp to [0, S_w-1] for safety
-            #   row_idx = floor(cy_g * S_h)
-            #
-            # gt_boxes[:, 0] = cx_g,  gt_boxes[:, 1] = cy_g
-            # ----------------------------------------------------------
-            cx_g = gt_boxes[:, 0]  # (N,)
-            cy_g = gt_boxes[:, 1]  # (N,)
+            lo, hi = self.scale_ranges[s]
+            for i in range(n_gt):
+                sz = float(size[i])
+                if not (lo <= sz < hi):
+                    continue
+                cx, cy, w, h = (float(v) for v in gt_boxes[i])
+                for idx in self._cells_for_gt(cx, cy, w, h, S_h, S_w):
+                    conf_target[idx] = 1.0
+                    box_target[idx]  = gt_boxes[i]
 
-            # floor → int; clamp guards against cx/cy == 1.0 exactly.
-            col_idx = (cx_g * S_w).long().clamp(0, S_w - 1)  # (N,)
-            row_idx = (cy_g * S_h).long().clamp(0, S_h - 1)  # (N,)
+            results.append((conf_target, box_target, conf_target.bool()))
 
-            # ----------------------------------------------------------
-            # Step 2: Flatten (row, col) → 1D cell index.
-            #
-            #   cell_idx = row_idx * S_w + col_idx
-            # ----------------------------------------------------------
-            cell_idx = row_idx * S_w + col_idx  # (N,) — flat index
-
-            # ----------------------------------------------------------
-            # Step 3: Write targets at those cell indices.
-            #
-            # If two GT boxes map to the same cell (overlapping people),
-            # the last-written GT wins. A more principled fix (choose the
-            # one with higher IoU at eval time) is listed in Part D.
-            # ----------------------------------------------------------
-            for i in range(gt_boxes.shape[0]):
-                idx = cell_idx[i].item()
-                conf_target[idx] = 1.0
-                box_target[idx]  = gt_boxes[i]  # (cx, cy, w, h)
-
-            pos_mask = conf_target.bool()  # (S_h*S_w,)
-            results.append((conf_target, box_target, pos_mask))
-
-        return results  # list of (conf_target, box_target, pos_mask) per scale
+        return results
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +321,47 @@ class FocalLoss(nn.Module):
             return focal.sum()
         else:  # "none"
             return focal
+
+
+class QualityFocalLoss(nn.Module):
+    """
+    Quality Focal Loss (Li et al. 2020 / Generalized Focal Loss).
+
+        QFL(σ(x), y) = -|y - σ(x)|^beta * BCE(x, y)
+
+    y ∈ [0,1] is a continuous quality target (the IoU of the predicted
+    box with its GT). At y=0 (background) this reduces exactly to focal
+    loss — background suppression is unchanged.
+
+    WHY THIS FIXES mAP@75:
+    With hard targets (y=1.0), a box with IoU=0.4 and IoU=0.9 get
+    identical training signal. Confidence scores carry no localisation
+    information. After QFL, conf ≈ IoU, so NMS automatically keeps the
+    tightest box — mAP@75 improves much more than mAP@50.
+
+    QFL ramp: at epoch 0 predictions are random and IoU ≈ 0, which would
+    make ALL positive targets ≈ 0 and prevent confidence from rising.
+    We ramp from hard targets (y=1.0) to soft IoU targets over the first
+    qfl_ramp_frac of training.
+    """
+
+    def __init__(self, beta: float = 2.0, alpha: float = 0.25):
+        super().__init__()
+        self.beta  = beta
+        self.alpha = alpha
+
+    def forward(
+        self,
+        logits:  torch.Tensor,   # (N,) raw logits
+        targets: torch.Tensor,   # (N,) continuous targets in [0,1]
+    ) -> torch.Tensor:
+        p    = torch.sigmoid(logits)
+        bce  = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        mod  = (targets - p).abs().detach().pow(self.beta)
+        loss = mod * bce
+        fg   = (targets > 0).float()
+        loss = loss * (self.alpha * fg + (1.0 - self.alpha) * (1.0 - fg))
+        return loss
 
 
 # ---------------------------------------------------------------------------
@@ -559,6 +558,64 @@ def ciou_loss(
     return loss  # (M,)
 
 
+def ciou_loss_with_iou(
+    pred_boxes: torch.Tensor,
+    gt_boxes: torch.Tensor,
+    eps: float = 1e-7,
+    aspect_scale: tuple = None,
+) -> tuple:
+    """
+    Identical to ciou_loss() but also returns iou.detach() as the
+    quality target for QFL.
+
+    aspect_scale: (W_px, H_px). When provided, the aspect-ratio term v
+    is computed in pixel space — matches Zheng et al. 2020 exactly and
+    corrects the normalised-space mismatch at non-square resolutions
+    like 640x384. Pass (640, 384) for this project.
+    """
+    pred_xyxy = _box_cxcywh_to_xyxy(pred_boxes)
+    gt_xyxy   = _box_cxcywh_to_xyxy(gt_boxes)
+
+    inter_x1 = torch.max(pred_xyxy[:, 0], gt_xyxy[:, 0])
+    inter_y1 = torch.max(pred_xyxy[:, 1], gt_xyxy[:, 1])
+    inter_x2 = torch.min(pred_xyxy[:, 2], gt_xyxy[:, 2])
+    inter_y2 = torch.min(pred_xyxy[:, 3], gt_xyxy[:, 3])
+    inter_w  = (inter_x2 - inter_x1).clamp(min=0.0)
+    inter_h  = (inter_y2 - inter_y1).clamp(min=0.0)
+    inter_area = inter_w * inter_h
+
+    pred_w, pred_h = pred_boxes[:, 2], pred_boxes[:, 3]
+    gt_w,   gt_h   = gt_boxes[:, 2],   gt_boxes[:, 3]
+    union_area = pred_w * pred_h + gt_w * gt_h - inter_area + eps
+    iou = (inter_area / union_area).clamp(0.0, 1.0)
+
+    cx_p, cy_p = pred_boxes[:, 0], pred_boxes[:, 1]
+    cx_g, cy_g = gt_boxes[:, 0],   gt_boxes[:, 1]
+    rho_sq = (cx_p - cx_g) ** 2 + (cy_p - cy_g) ** 2
+
+    encl_x1 = torch.min(pred_xyxy[:, 0], gt_xyxy[:, 0])
+    encl_y1 = torch.min(pred_xyxy[:, 1], gt_xyxy[:, 1])
+    encl_x2 = torch.max(pred_xyxy[:, 2], gt_xyxy[:, 2])
+    encl_y2 = torch.max(pred_xyxy[:, 3], gt_xyxy[:, 3])
+    c_sq = (encl_x2 - encl_x1) ** 2 + (encl_y2 - encl_y1) ** 2 + eps
+    diou_term = rho_sq / c_sq
+
+    if aspect_scale is not None:
+        Wp, Hp = aspect_scale
+        atan_gt   = torch.atan(_safe_div(gt_w   * Wp, gt_h   * Hp))
+        atan_pred = torch.atan(_safe_div(pred_w * Wp, pred_h * Hp))
+    else:
+        atan_gt   = torch.atan(_safe_div(gt_w,   gt_h))
+        atan_pred = torch.atan(_safe_div(pred_w, pred_h))
+
+    v = (4.0 / (math.pi ** 2)) * (atan_gt - atan_pred) ** 2
+    with torch.no_grad():
+        alpha_ciou = v / ((1.0 - iou) + v + eps)
+
+    loss = 1.0 - iou + diou_term + alpha_ciou * v
+    return loss, iou.detach()
+
+
 # ---------------------------------------------------------------------------
 # Combined NIRDet Loss
 # ---------------------------------------------------------------------------
@@ -624,29 +681,35 @@ class NIRDetLoss(nn.Module):
         self,
         grid_sizes: Tuple[Tuple[int, int], ...] = ((48, 80), (24, 40), (12, 20)),
         lambda_cls: float = 1.0,
-        lambda_reg: float = 5.0,
+        lambda_reg: float = 2.0,     # reduced from 5.0 — QFL shifts cls/reg balance
         lambda_conf: float = 1.0,
         focal_gamma: float = 2.0,
         focal_alpha: float = 0.25,
+        quality_target: bool = True,
+        qfl_ramp_frac: float = 0.20, # ramp hard→soft over first 20 epochs (of 100)
+        total_epochs: int = 100,     # 100 epoch target for miniNIRPed
+        img_h: int = 384,
+        img_w: int = 640,
     ):
-        """
-        Args:
-            grid_sizes:   (S_h, S_w) spatial grids per scale (must match model).
-            lambda_cls:   Weight for focal classification loss.
-            lambda_reg:   Weight for CIoU regression loss (positives only).
-            lambda_conf:  Weight for objectness/confidence focal loss.
-            focal_gamma:  Focusing exponent for FocalLoss (default 2, [Lin 2017]).
-            focal_alpha:  Foreground weight for FocalLoss (default 0.25).
-        """
         super().__init__()
+        self.grid_sizes     = grid_sizes
+        self.lambda_cls     = lambda_cls
+        self.lambda_reg     = lambda_reg
+        self.lambda_conf    = lambda_conf
+        self.quality_target = quality_target
+        self.qfl_ramp_frac  = qfl_ramp_frac
+        self.total_epochs   = total_epochs
+        self.img_h = img_h
+        self.img_w = img_w
+        self._epoch = 0
 
-        self.grid_sizes   = grid_sizes
-        self.lambda_cls   = lambda_cls
-        self.lambda_reg   = lambda_reg
-        self.lambda_conf  = lambda_conf
-
-        self.assigner  = LabelAssigner(grid_sizes=grid_sizes)
+        self.assigner   = LabelAssigner(grid_sizes=grid_sizes)
         self.focal_loss = FocalLoss(gamma=focal_gamma, alpha=focal_alpha, reduction="none")
+        self.qfl        = QualityFocalLoss(beta=focal_gamma, alpha=focal_alpha)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Call from train.py each epoch: criterion.set_epoch(epoch)"""
+        self._epoch = epoch
 
     # ------------------------------------------------------------------
 
@@ -702,10 +765,12 @@ class NIRDetLoss(nn.Module):
         w_raw  = raw_pred[:, 2]  # (P,)
         h_raw  = raw_pred[:, 3]  # (P,)
 
-        # cx = (σ(cx_raw) + col_offset) / S_w   → absolute normalized x ∈ [0,1]
-        cx = (torch.sigmoid(cx_raw) + col_offsets) / S_w
+        # DECODE_OFFSET_SCALE=2.0: range is [-0.5, 1.5] cells.
+        # Required for cross3 — neighbour cells need offset > 1.0 or < 0.0.
+        # MUST match head.py inference decode exactly.
+        cx = (_OFF_S * torch.sigmoid(cx_raw) - _OFF_B + col_offsets) / S_w
         # cy = (σ(cy_raw) + row_offset) / S_h   → absolute normalized y ∈ [0,1]
-        cy = (torch.sigmoid(cy_raw) + row_offsets) / S_h
+        cy = (_OFF_S * torch.sigmoid(cy_raw) - _OFF_B + row_offsets) / S_h
         # w  = exp(w_raw) in normalized [0,1] units.
         # BUG FIX: clamp w_raw before exp to prevent fp32 overflow (exp(89)=inf),
         # then clamp the output to (1e-4, 1.0) so decoded boxes stay within the image.
@@ -722,142 +787,91 @@ class NIRDetLoss(nn.Module):
     def forward(
         self,
         predictions: List[torch.Tensor],
-        # list of (B, S*S, 5) — one tensor per scale, raw logits
         gt_batch: List[List[torch.Tensor]],
-        # gt_batch[b] = list of GT boxes for image b
-        # each GT: (4,) tensor [cx, cy, w, h] in [0,1]
     ) -> Dict[str, torch.Tensor]:
-        """
-        Compute the combined NIRDet loss over a batch.
-
-        Args:
-            predictions: List of length len(grid_sizes).
-                         predictions[s] has shape (B, S_h*S_w, 5).
-                         Channel order: [cx_off, cy_off, w, h, conf_logit].
-            gt_batch:    Outer list length B (batch size).
-                         gt_batch[b] is a list of GT box tensors (N_b, 4)
-                         or an empty list if the image has no objects.
-
-        Returns:
-            Dict with keys: "total", "cls", "reg", "conf"
-            All values are scalar tensors (differentiable).
-        """
         device = predictions[0].device
         B = predictions[0].shape[0]
 
-        # Accumulators — plain Python floats so the first tensor addition
-        # creates a proper autograd node (a pre-allocated zero tensor with
-        # requires_grad=False would detach the graph on the first +=).
+        # QFL ramp: 0.0 at epoch 0 (hard targets), 1.0 at epoch 20 (soft IoU)
+        ramp_end = max(1, int(self.qfl_ramp_frac * self.total_epochs))
+        qfl_lam  = min(1.0, self._epoch / ramp_end) if self.quality_target else 0.0
+
         total_cls_loss  = 0.0
         total_reg_loss  = 0.0
         total_conf_loss = 0.0
-        n_images_processed = 0
+
+        # ── Pass 1: assignments + decode for every image in the batch;
+        #    accumulate the TOTAL number of positive cells across ALL images. ──
+        batch_assigns = []
+        total_pos = 0
 
         for b in range(B):
-            # ----------------------------------------------------------
-            # Collect GT boxes for image b.
-            # gt_boxes: (N, 4) or (0, 4) tensor.
-            # ----------------------------------------------------------
             gt_list = gt_batch[b]
             if len(gt_list) == 0:
                 gt_boxes = torch.zeros((0, 4), dtype=torch.float32, device=device)
             else:
-                gt_boxes = torch.stack(gt_list, dim=0).to(device)  # (N, 4)
+                gt_boxes = torch.stack(gt_list, dim=0).to(device)
 
-            # ----------------------------------------------------------
-            # Run label assigner to get per-scale targets.
-            # ----------------------------------------------------------
             assignments = self.assigner.assign(gt_boxes, device)
-            # assignments[s] = (conf_target, box_target, pos_mask)
 
+            per_scale = []
             for s, (S_h, S_w) in enumerate(self.grid_sizes):
-                # Raw predictions for scale s, image b: (S_h*S_w, 5)
-                pred = predictions[s][b]  # (S_h*S_w, 5)
-
+                pred = predictions[s][b]
                 conf_target, box_target, pos_mask = assignments[s]
-                # conf_target: (S_h*S_w,) float, 1 at positives
-                # box_target:  (S_h*S_w, 4) float, GT box at positives
-                # pos_mask:    (S_h*S_w,) bool
+                n_pos_s = int(pos_mask.sum())
+                total_pos += n_pos_s
 
-                # -------------------------------------------------------
-                # Confidence / objectness logits: pred[:, 4]
-                # -------------------------------------------------------
-                conf_logits = pred[:, 4]  # (S_h*S_w,) raw logits
-
-                # -------------------------------------------------------
-                # Classification loss (Focal) — applied to ALL cells.
-                #
-                # For single-class detection, the confidence/objectness
-                # score IS the classification score. We compute focal loss
-                # over all S² cells so that both positives and the mass of
-                # easy negatives are accounted for.
-                # -------------------------------------------------------
-                focal_vals = self.focal_loss(conf_logits, conf_target)  # (S²,)
-
-                # FIX: normalize focal by n_pos (Lin et al. RetinaNet §4: "normalized by
-                # the number of anchors assigned to a ground-truth box"). The earlier
-                # .mean() (=sum/S²) divided cls by ~5040 while reg is divided by n_pos≈3,
-                # making the confidence gradient ~1680x too weak -> conf never rose -> mAP=0.
-                # This does NOT re-amplify background: dividing the SUM by n_pos scales
-                # foreground and background identically; focal (1-p)^γ·α already balances them.
-                n_pos = pos_mask.sum().float().clamp(min=1.0)  # still needed for reg
-                cls_loss_s = focal_vals.sum() / n_pos   # FIX: normalize by n_pos per Lin et al. RetinaNet §4; .mean()=sum/S² shrank cls ~1680x vs reg and starved the confidence gradient (conf stuck ~0.07 -> mAP=0). Dividing the sum by n_pos scales fg and bg equally, so this does NOT re-amplify background.
-
-                # FIX Bug7: conf_bce_s is for MONITORING ONLY — keep it detached.
-                # Previously total_conf_loss fed into total_loss with lambda_conf=1.0,
-                # adding a second unmodulated BCE gradient on top of focal loss.
-                # Plain BCE gives equal weight to all 5040 cells, so 5037 background
-                # cells dominated by ~79x, driving conf logits to -inf regardless of
-                # the focal loss. Now conf_bce_s is always detached and never enters
-                # the gradient. The 'conf' key in the return dict is monitoring only.
-                with torch.no_grad():
-                    conf_bce_s = F.binary_cross_entropy_with_logits(
-                        conf_logits, conf_target, reduction="mean"
-                    )  # FIX: always no_grad — monitoring only, excluded from total_loss
-
-                # -------------------------------------------------------
-                # Regression loss (CIoU) — ONLY on positive cells.
-                #
-                # Only positive cells have a valid GT box. Applying CIoU
-                # to background cells is meaningless (their box_target is
-                # zeros, not a real GT box).
-                # -------------------------------------------------------
-                if pos_mask.any():
-                    # Extract predictions and targets for positive cells.
-                    pred_raw_pos = pred[pos_mask, :4]    # (P, 4) — cx, cy, w, h raw
-                    gt_pos       = box_target[pos_mask]   # (P, 4)
-
-                    # Cell indices for the positive cells (needed for decoding).
-                    # pos_mask is (S_h*S_w,) bool → nonzero gives the flat cell indices.
-                    pos_cell_idx = pos_mask.nonzero(as_tuple=False).squeeze(-1)  # (P,)
-
-                    # Decode raw predictions → normalized box coords.
-                    decoded_pos = self._decode_pred_boxes(
-                        pred_raw_pos, pos_cell_idx, S_h, S_w
+                if n_pos_s > 0:
+                    pos_idx = pos_mask.nonzero(as_tuple=False).squeeze(-1)
+                    decoded = self._decode_pred_boxes(
+                        pred[pos_mask, :4], pos_idx, S_h, S_w
                     )
-
-                    # CIoU loss per matched pair: (P,)
-                    reg_vals = ciou_loss(decoded_pos, gt_pos)
-
-                    # Normalise by number of positives.
-                    reg_loss_s = reg_vals.sum() / n_pos
+                    reg_vals, iou = ciou_loss_with_iou(
+                        decoded, box_target[pos_mask],
+                        aspect_scale=(self.img_w, self.img_h),
+                    )
+                    if self.quality_target and qfl_lam > 0:
+                        conf_t = conf_target.clone()
+                        conf_t[pos_mask] = (1.0 - qfl_lam) * 1.0 + qfl_lam * iou
+                    else:
+                        conf_t = conf_target
                 else:
-                    # No positive cells → regression contribution = 0 (no grad needed).
-                    reg_loss_s = 0.0
+                    reg_vals = None
+                    conf_t   = conf_target
 
-                # Accumulate across scales.
-                total_cls_loss  = total_cls_loss  + cls_loss_s
-                total_reg_loss  = total_reg_loss  + reg_loss_s
-                total_conf_loss = total_conf_loss + conf_bce_s
+                per_scale.append((pred, conf_t, pos_mask, reg_vals))
 
-            n_images_processed += 1
+            batch_assigns.append(per_scale)
 
-        # Average over batch and scales.
-        n_scale = float(len(self.grid_sizes))
-        denom = float(max(n_images_processed, 1)) * n_scale
+        # FIX: batch-wide normalisation — ONE norm from ALL positives across
+        # the whole batch (RetinaNet §4), instead of a per-image /max(total_pos,1).
+        # Per-image normalisation gave a sparse image (1 positive) the same loss
+        # scale as a dense one (8 positives), inflating gradients from sparse
+        # images; batch-wide makes the scale consistent across the whole batch.
+        norm = float(max(total_pos, 1))
 
-        # Convert accumulators to tensors (they may still be plain 0.0 floats
-        # if the whole batch had no objects — a tensor is required for .backward()).
+        # ── Pass 2: compute losses, all divided by the SAME batch-wide norm. ──
+        for per_scale in batch_assigns:
+            for (pred, conf_t, pos_mask, reg_vals) in per_scale:
+                conf_logits = pred[:, 4]
+
+                if self.quality_target:
+                    cls_vals = self.qfl(conf_logits, conf_t)
+                else:
+                    cls_vals = self.focal_loss(conf_logits, conf_t)
+                total_cls_loss = total_cls_loss + cls_vals.sum() / norm
+
+                if reg_vals is not None:
+                    total_reg_loss = total_reg_loss + reg_vals.sum() / norm
+
+                with torch.no_grad():
+                    conf_bce = F.binary_cross_entropy_with_logits(
+                        conf_logits, (conf_t > 0).float(), reduction="mean"
+                    )
+                    total_conf_loss = total_conf_loss + conf_bce
+
+        denom = float(max(B, 1))
+
         if isinstance(total_cls_loss, float):
             total_cls_loss = torch.tensor(total_cls_loss, device=device, dtype=torch.float32)
         if isinstance(total_reg_loss, float):
@@ -869,28 +883,13 @@ class NIRDetLoss(nn.Module):
         reg_loss  = total_reg_loss  / denom
         conf_loss = total_conf_loss / denom
 
-        # ----------------------------------------------------------------
-        # Weighted total:
-        #   total = λ_cls · cls + λ_reg · reg
-        #
-        # FIX Bug7: conf_loss (plain BCE) is excluded from total_loss.
-        # It is logged in the return dict as a monitoring signal only.
-        # Including it was double-counting background suppression on top
-        # of focal loss, overwhelming foreground cells by ~79x.
-        # cls_loss (focal) already provides all the confidence gradient
-        # needed — adding unmodulated BCE on top breaks the focal balance.
-        # ----------------------------------------------------------------
-        total_loss = (
-            self.lambda_cls * cls_loss +
-            self.lambda_reg * reg_loss
-            # conf_loss intentionally excluded — monitoring only (FIX Bug7)
-        )
+        total_loss = self.lambda_cls * cls_loss + self.lambda_reg * reg_loss
 
         return {
-            "total": total_loss,   # gradient flows here
-            "cls":   cls_loss,     # focal classification loss
-            "reg":   reg_loss,     # CIoU regression loss (positives only)
-            "conf":  conf_loss,    # plain BCE confidence loss (monitoring)
+            "total": total_loss,
+            "cls":   cls_loss,
+            "reg":   reg_loss,
+            "conf":  conf_loss,   # monitoring only, not in total_loss
         }
 
 
@@ -970,41 +969,29 @@ def test_single_gt():
     preds_random = _make_dummy_predictions(B, grid_sizes, device, seed=7)
     out_random   = loss_fn(preds_random, gt_batch)
 
-    # Now set the positive cell's prediction to match the GT closely.
-    # Positive cell for S=(48,80): col=floor(0.5*80)=40, row=floor(0.5*48)=24
-    # cell_idx = 24*80 + 40 = 1960
+    # Now set the positive cells' predictions to match the GT closely.
+    # With scale routing, GT (0.1×0.3 → max(64, 115.2)=115.2px) is assigned
+    # ONLY to level 1 (scale range (48,160)); cross3 adds up to two neighbour
+    # cells. Write the match to every cell the assigner actually marked.
     preds_good = [p.clone() for p in preds_random]
 
-    S_h0, S_w0 = grid_sizes[0]  # 48, 80
-    col_gt = int(gt_cx * S_w0)  # 40
-    row_gt = int(gt_cy * S_h0)  # 24
-    cell_gt = row_gt * S_w0 + col_gt  # 1960
-
-    # For the predictions to decode to (gt_cx, gt_cy, gt_w, gt_h):
-    #   cx = (sigmoid(cx_off) + col_gt) / S_w  = gt_cx
-    #   → sigmoid(cx_off) = gt_cx * S_w - col_gt = 0.5*80 - 40 = 0.0
-    #   → cx_off = logit(0.5) = 0.0   (since sigmoid(0) = 0.5 → 0.5/S_w+col/S_w=...
-    # Actually: cx = (sigmoid(0) + 40) / 80 = (0.5 + 40) / 80 = 0.50625 ≈ 0.5
-    # Close enough for a test. Let's set logits to zero for cx and cy offsets,
-    # and set w/h to match:
-    #   w = exp(w_raw) → w_raw = log(gt_w) = log(0.1)
-    #   h = exp(h_raw) → h_raw = log(gt_h) = log(0.3)
-    #   conf logit → large positive (confident foreground)
-
-    preds_good[0][0, cell_gt, 0] = 0.0                   # cx_off → sigmoid=0.5, cx≈0.506
-    preds_good[0][0, cell_gt, 1] = 0.0                   # cy_off → cy≈0.506
-    preds_good[0][0, cell_gt, 2] = math.log(gt_w)        # w = 0.1
-    preds_good[0][0, cell_gt, 3] = math.log(gt_h)        # h = 0.3
-    preds_good[0][0, cell_gt, 4] = 6.0                   # conf logit → σ(6)≈0.998
+    assignments = loss_fn.assigner.assign(gt_tensor, device)
+    for s, (_conf_t, _box_t, mask) in enumerate(assignments):
+        pos_cells = mask.nonzero(as_tuple=False).squeeze(-1)
+        for idx in pos_cells.tolist():
+            preds_good[s][0, idx, 0] = 0.0          # cx_off → sigmoid=0.5 → cell-centred
+            preds_good[s][0, idx, 1] = 0.0          # cy_off
+            preds_good[s][0, idx, 2] = math.log(gt_w)   # w = 0.1
+            preds_good[s][0, idx, 3] = math.log(gt_h)   # h = 0.3
+            preds_good[s][0, idx, 4] = 6.0          # conf logit → σ(6)≈0.998
 
     out_good = loss_fn(preds_good, gt_batch)
 
     # Verify exactly one positive across all scales.
     assignments = loss_fn.assigner.assign(gt_tensor, device)
     n_pos_total = sum(a[2].sum().item() for a in assignments)
-    assert n_pos_total == len(grid_sizes), (
-        f"Expected {len(grid_sizes)} positive cells (one per scale), "
-        f"got {n_pos_total}"
+    assert n_pos_total >= 1, (
+        f"Expected at least 1 positive, got {n_pos_total}"
     )
 
     print(f"  Positive cells total (all scales): {int(n_pos_total)}  "
@@ -1088,19 +1075,19 @@ def test_loss_direction():
     preds_random = _make_dummy_predictions(B, grid_sizes, device, seed=999)
     out_random   = loss_fn(preds_random, gt_batch)
 
-    # Clone and surgically improve the positive cell for scale 0 (48×80).
+    # Clone and surgically improve the positive cells (whatever level the
+    # assigner routed this GT to — size = max(51.2, 96) = 96px → level 1).
     preds_good = [p.clone() for p in preds_random]
-    S_h0, S_w0 = grid_sizes[0]
-    col  = int(gt_cx * S_w0)   # 16
-    row  = int(gt_cy * S_h0)   # 14   (was 24 at S=80 square)
-    cidx = row * S_w0 + col    # 14*80+16 = 1136
 
-    # Set to near-perfect match (same logic as Test 2).
-    preds_good[0][0, cidx, 0] = 0.0               # cx sigmoid-centered
-    preds_good[0][0, cidx, 1] = 0.0               # cy sigmoid-centered
-    preds_good[0][0, cidx, 2] = math.log(gt_w)   # w ≈ 0.08
-    preds_good[0][0, cidx, 3] = math.log(gt_h)   # h ≈ 0.25
-    preds_good[0][0, cidx, 4] = 8.0              # conf → σ(8) ≈ 0.9997
+    assignments = loss_fn.assigner.assign(gt_tensor, device)
+    for s, (_conf_t, _box_t, mask) in enumerate(assignments):
+        pos_cells = mask.nonzero(as_tuple=False).squeeze(-1)
+        for idx in pos_cells.tolist():
+            preds_good[s][0, idx, 0] = 0.0               # cx sigmoid-centered
+            preds_good[s][0, idx, 1] = 0.0               # cy sigmoid-centered
+            preds_good[s][0, idx, 2] = math.log(gt_w)   # w ≈ 0.08
+            preds_good[s][0, idx, 3] = math.log(gt_h)   # h ≈ 0.25
+            preds_good[s][0, idx, 4] = 8.0              # conf → σ(8) ≈ 0.9997
 
     out_good = loss_fn(preds_good, gt_batch)
 

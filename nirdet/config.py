@@ -47,18 +47,18 @@ from typing import Optional, Tuple
 # VRAM estimates in validate_config().
 # ---------------------------------------------------------------------------
 
-GPU_VRAM_GB: float = 8.0          # ← REPLACE: Your GPU VRAM in GB (e.g. 8.0, 16.0, 24.0)
+GPU_VRAM_GB: float = 6.4          # ← REPLACE: Your GPU VRAM in GB (e.g. 8.0, 16.0, 24.0)
                                    #   Effect: larger VRAM → larger batch → better gradient estimates
 
-PYTORCH_VERSION: str = "2.3.0"    # ← REPLACE: e.g. "2.0.1", "2.3.0", "2.4.0"
+PYTORCH_VERSION: str = "2.6.0"    # ← REPLACE: e.g. "2.0.1", "2.3.0", "2.4.0"
                                    #   Used for compile() compat check in validate_config()
 
-DATASET_TRAIN_COUNT: int = 3000    # ← REPLACE: number of training images
+DATASET_TRAIN_COUNT: int = 261    # ← REPLACE: number of training images
                                    #   Critical for: Mosaic threshold, LR schedule length
 
-DATASET_VAL_COUNT: int = 600       # ← REPLACE: number of validation images
+DATASET_VAL_COUNT: int = 160      # ← REPLACE: number of validation images
 
-BASELINE_MAP50: float = 0.45       # ← REPLACE: mAP50 of the baseline model you're beating
+BASELINE_MAP50: float = 0.735     # ← REPLACE: mAP50 of the baseline model you're beating
 
 
 # ===========================================================================
@@ -186,7 +186,7 @@ class ModelConfig:
     # --- Backbone: NIR-Native Backbone ---
     # Stage output channels [stem, stage1, stage2, stage3, stage4]
     # Doubling channels per stage is standard; we stay narrow to hit <5M param target.
-    backbone_channels: Tuple[int, ...] = (16, 32, 128, 256, 256)  # FIX: match actual backbone out = (base*4, base*8, base*8) -> P3/P4/P5 = (128,256,256)
+    backbone_channels: Tuple[int, ...] = (32, 32, 128, 256, 256)  # FIX: index 0 was 16 but NIRStem outputs base_ch=32. Now both [0] and [1] correctly document the stem width.
     # Effect of increasing: richer features, more parameters, more VRAM.
     # Effect of decreasing: fewer parameters, risk of underfitting on complex scenes.
     # Range: (8,16,32,64,128) for ultra-light; (32,64,128,256,512) for higher-capacity.
@@ -229,8 +229,8 @@ class ModelConfig:
     # FIX: removed num_anchors_per_cell/anchor_sizes — NIRDet is anchor-free
     # (center-cell assignment). Head hardwires feat_channels=256.
     head_channels: int = 256          # FIX: head uses 256, not 128
-    prior_w: float = 0.04             # width prior from miniNIRPed GT stats
-    prior_h: float = 0.15             # height prior from miniNIRPed GT stats
+    prior_w: float = 0.0461            # width prior from miniNIRPed GT stats
+    prior_h: float = 0.1680            # height prior from miniNIRPed GT stats
     detection_scales: int = 3
     # Number of FPN-style detection scales (multi-scale output heads).
     # 3: P3 (large objects), P4 (medium), P5 (small). Standard YOLO setup.
@@ -620,15 +620,12 @@ class AugmentationConfig:
     # -----------------------------------------------------------------------
 
     normalize_mean: Tuple[float, ...] = (0.5,)
-    # Per-channel mean for input normalization. Single value for grayscale.
-    # 0.5 is a reasonable prior for NIR imagery.
-    # ← REPLACE: compute from your actual training set using tools/compute_stats.py.
-    # Formula: mean = sum(pixel_values) / (N_images * H * W)
+    # NOTE: dataset.py normalises to [0,1] by /255 only — these fields are
+    # currently unused. Re-add them only if dataset.py adds a Normalize step.
 
     normalize_std: Tuple[float, ...] = (0.25,)
-    # Per-channel std for input normalization.
-    # ← REPLACE: compute from your training set.
-    # Note: std ≈ 0.25 means most pixels fall in [0, 1] after (x - 0.5) / 0.25.
+    # NOTE: dataset.py normalises to [0,1] by /255 only — these fields are
+    # currently unused. Re-add them only if dataset.py adds a Normalize step.
 
 
 # ===========================================================================
@@ -1171,6 +1168,11 @@ empirical validation on YOUR dataset and hardware.
 # ===========================================================================
 # MAIN — Print config summary when run directly
 # ===========================================================================
+
+# ── Decode parametrisation constant (must be identical in head.py and losses.py) ──
+# 1.0 → offset ∈ [0,1]   (original — centre confined to its own cell)
+# 2.0 → offset ∈ [-0.5, 1.5] (YOLOv5 range, required for cross3 neighbour assignment)
+DECODE_OFFSET_SCALE: float = 2.0
 
 if __name__ == "__main__":
     import json
