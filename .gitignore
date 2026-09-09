@@ -26,3 +26,10 @@ nirdet/eval_outputs/hard_cases/
 nirdet/debug_aug.jpg
 nirdet/eval_outputs/predictions/
 .pytest_cache/
+
+# nirdet_lite — artifacts not tracked
+nirdet_lite/checkpoints/
+nirdet_lite/*.onnx
+nirdet_lite/*.bak
+nirdet_lite/eval_outputs/
+nirdet_lite/__pycache__/
