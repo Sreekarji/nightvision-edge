@@ -1,0 +1,66 @@
+# NIRDet-Lite dataset profile. The 'derived:' section is machine-
+# generated from the label file bytes and the labelled images'
+# dimensions — never hand-edit it; verify_fresh() detects edits and
+# training refuses to run against a stale profile. Regenerate with:
+#     python dataset_profiles.py --root <root> --out <this file>
+# 
+# prior_w / prior_h are medians over LETTERBOX-CANVAS boxes (see the
+# dataset_profiles.py docstring), which is what the head consumes.
+# 
+# deploy_score_thresh is NOT derived (it requires a training run);
+# evaluate.py writes the best-F1 threshold back here after each full
+# training + evaluation cycle.
+
+name: miniNIRPed_261
+root: C:/projects/nightvision/data/raw/miniNIRPed
+generated_utc: '2026-09-07T16:16:30+00:00'
+derived:
+  img_h: 384
+  img_w: 640
+  n_train: 261
+  n_val: 160
+  n_train_images: 261
+  prior_w: 0.046094
+  prior_h: 0.167969
+  label_fingerprint: sha256:2ef92ef957ff0bb8a9fb87cab131ae0d9ddd34ddc71b1e55d485eb70960a8434
+  image_geometry_fingerprint: sha256:cbd560a772d2f98c5aa8bdbe6c68593edff8049dd37713a67c435f50eb72b3ce
+  stats:
+    n_label_files_by_split:
+      test: 165
+      train: 261
+      val: 160
+    n_images_by_split:
+      test: 165
+      train: 261
+      val: 160
+    coordinate_space: letterbox canvas (384x640)
+    train:
+      n_boxes: 948
+      boxes_per_image:
+        mean: 3.6322
+        median: 3.0
+        max: 11
+      empty_label_fraction: 0.02682
+      raw_median_w: 0.046094
+      raw_median_h: 0.179167
+      width_percentiles:
+        min: 0.017188
+        max: 0.571094
+        p1: 0.020313
+        p5: 0.023711
+        p25: 0.033594
+        p50: 0.046094
+        p75: 0.071094
+        p95: 0.147383
+        p99: 0.240258
+      height_percentiles:
+        min: 0.048177
+        max: 0.84375
+        p1: 0.057292
+        p5: 0.070768
+        p25: 0.110677
+        p50: 0.167969
+        p75: 0.255534
+        p95: 0.545573
+        p99: 0.645378
+deploy_score_thresh: null
