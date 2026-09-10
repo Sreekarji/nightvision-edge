@@ -515,13 +515,13 @@ def main(args: argparse.Namespace) -> int:
         cfg.train.es_enabled = False
         log.info("=== SMOKE TEST: 5 epochs, 10 images, no augmentation ===")
     if args.overfit_test:
-        cfg.train.epochs = 300
+        cfg.train.epochs = 100
         cfg.train.warmup_steps = 0
         cfg.train.lr_peak = cfg.train.lr_start = cfg.train.lr_min = 1e-3
         cfg.train.val_interval = 25
         cfg.train.es_enabled = False
         cfg.train.imagenet_stem_init = False
-        log.info("=== OVERFIT TEST: 300 epochs, flat LR, 10 images ===")
+        log.info("=== OVERFIT TEST: 100 epochs, flat LR, 10 images ===")
 
     validate_config(cfg, verbose=True)
     set_seed(cfg.train.seed, deterministic=args.deterministic)
@@ -750,7 +750,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--smoke-test", action="store_true",
                    help="5 epochs on 10 images: verify no NaN, no OOM")
     p.add_argument("--overfit-test", action="store_true",
-                   help="300 epochs, flat LR, 10 images: loss must approach 0")
+                   help="100 epochs, flat LR, 10 images: loss must approach 0")
     return p.parse_args()
 
 

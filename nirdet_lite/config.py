@@ -142,7 +142,7 @@ class AugCfg:
 @dataclass
 class TrainCfg:
     checkpoint_dir: str = r"C:\projects\nightvision\nirdet_lite\checkpoints"
-    epochs: int = 150
+    epochs: int = 100
     batch_size: int = 8
     optimizer: str = "adamw"               # "adamw" | "sgd"
     lr_peak: float = 8e-4

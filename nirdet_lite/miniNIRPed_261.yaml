@@ -13,7 +13,7 @@
 
 name: miniNIRPed_261
 root: C:/projects/nightvision/data/raw/miniNIRPed
-generated_utc: '2026-09-08T01:40:47+00:00'
+generated_utc: '2026-09-10T13:10:55+00:00'
 derived:
   img_h: 384
   img_w: 640
@@ -63,4 +63,4 @@ derived:
         p75: 0.255534
         p95: 0.545573
         p99: 0.645378
-deploy_score_thresh: 0.4455
+deploy_score_thresh: 0.3998
