@@ -1,29 +1,19 @@
 """
 quantize_qdq.py — INT8 QDQ quantization with the training preprocessing
 ========================================================================
-    python quantize_qdq.py --onnx nirdet-sim.onnx \
-                           --profile datasets/miniNIRPed_261.yaml
+    python quantize_qdq.py --onnx nirdet-sim.onnx --profile datasets/<n>.yaml
 
-WHY THE REGRESSION CONV WAS SPLIT
----------------------------------
-The head used to emit reg (4 channels) = (t_cx, t_cy, t_w, t_h) as one
-tensor, so in INT8 QDQ all four channels shared one quantisation scale. But
-t_cx/t_cy are practically +/-6 after training while t_w/t_h are clamped to
-[REG_LOG_CLAMP_MIN, REG_LOG_CLAMP_MAX] = [-6, 1]. The union forces the scale
-to cover [-6, 6]: 12.0/255 = 0.047 per LSB in log space, versus 7.0/255 =
-0.027 (2.7%) for the size branch alone. On a 29 px pedestrian at stride 8
-that is +/-1.4 px versus +/-0.8 px of width per quantisation step.
+The head emits off and size as separate convolutions so the quantiser gives
+them independent scales: t_cx/t_cy are practically +/-6 while t_w/t_h are
+clamped to [-6, 1], and a shared scale spanning [-6, 6] costs 4.7% of box
+width per LSB instead of 2.7%. This script PRINTS both per stride. A MISSING
+scale is fatal; IDENTICAL scales are only a WARNING and do NOT change the
+exit code (F82: ORT can legitimately assign equal scales to very narrow
+off/size distributions). evaluate_onnx.py --int8 is the gate, not this
+script.
 
-With off_pred and size_pred as separate convolutions the quantiser assigns them
-independent scale / zero-point pairs. This script PRINTS both and fails loudly
-if they came out identical, because identical scales mean the split did not
-survive to the QDQ graph and the whole exercise bought nothing.
-
-PREPROCESSING PARITY
-Calibration uses dataset.preprocess_frame — the same flat-field, the same
-CLAHE switch, the same letterbox, the same /255 as training. Calibrating on a
-different distribution is the single most common way to lose several mAP
-points in INT8 and blame the quantiser.
+Calibration uses dataset.preprocess_frame — the same flat-field, CLAHE switch,
+letterbox and /255 as training.
 """
 
 from __future__ import annotations
@@ -38,10 +28,14 @@ import numpy as np
 from config import Config, get_config, validate_config
 from dataset import (list_images, load_flat_field, preprocess_frame,
                      resolve_split_dirs)
+# graph_input_name lives in export_onnx (needs only `onnx`), so importing it
+# does not drag the quantisation toolchain into fp32-only consumers. Re-exported
+# here for backward compatibility.
+from export_onnx import graph_input_name  # noqa: F401
 
 try:
     import onnx
-    import onnxruntime as ort
+    from onnx import numpy_helper
     from onnxruntime.quantization import (CalibrationDataReader,
                                           CalibrationMethod, QuantFormat,
                                           QuantType, quantize_static,
@@ -54,76 +48,135 @@ except ImportError as exc:                                   # pragma: no cover
 import cv2
 
 
+def first_conv_names_on_input(model_path: str, input_name: str) -> List[str]:
+    """
+    Every Conv that directly consumes the graph input.
+
+    After quant_pre_process the input feeds BOTH the NIR stem and
+    eaa.edge_conv; both sit on the raw sensor distribution and both are
+    calibration outliers, so excluding only one leaves the other quantised
+    against a distribution it was never calibrated for.
+    """
+    m = onnx.load(model_path)
+    names = [n.name for n in m.graph.node
+             if n.op_type == "Conv" and n.input and n.input[0] == input_name]
+    if not names:
+        raise RuntimeError(
+            f"no Conv consumes graph input '{input_name}' in {model_path} — "
+            f"--exclude-first-conv found nothing to exclude")
+    return names
+
+
 # ===========================================================================
 # calibration reader
 # ===========================================================================
 
 class NIRCalibrationReader(CalibrationDataReader):
-    """
-    Feeds calibration tensors through the EXACT training preprocessing chain.
+    """Feeds calibration tensors through the EXACT training preprocessing."""
 
-    Images are drawn from the training split and shuffled with a fixed seed
-    so calibration is reproducible. The same flat-field, CLAHE switch,
-    letterbox and /255 that training saw — using a different pipeline
-    calibrates the wrong distribution.
-    """
-
-    def __init__(self, cfg: Config, n_images: int, seed: int = 42,
+    def __init__(self, cfg: Config, n_images: int, input_name: str,
+                 seed: int = 42,
                  flat_field: Optional[np.ndarray] = None) -> None:
         self.cfg = cfg
-        img_dir, _ = resolve_split_dirs(cfg.data.root, "train")
-        paths = sorted(list_images(img_dir))
-        rng = random.Random(seed)
-        rng.shuffle(paths)
-        self.paths = paths[:n_images]
+        self.input_name = input_name
+        # F49: shared seeded selection with export_ncnn so ORT and NCNN
+        # calibrate on identical images. `seed` is kept in the signature for
+        # backward compatibility but the authority is cfg.export.calib_seed.
+        from config import calibration_paths
+        _cs = int(seed if seed is not None else cfg.export.calib_seed)
+        self.paths = calibration_paths(cfg.data.root, "train",
+                                       n=n_images, seed=_cs)
         self.flat_field = flat_field
         self._idx = 0
+        if not self.paths:
+            # quantize_static does NOT treat zero calibration data as an
+            # error: it emits a graph with no measured activation ranges and
+            # exits 0 — the worst possible INT8 failure mode (F89).
+            raise SystemExit(
+                f"no calibration images for the train split. Calibrating on zero "
+                f"images produces a QDQ graph with no measured activation "
+                f"ranges, which quantize_static does NOT treat as an error.")
+        print(f"[calib] {len(self.paths)} images (seed={_cs})")
 
     def get_next(self) -> Optional[Dict[str, np.ndarray]]:
-        if self._idx >= len(self.paths):
-            return None
-        p = self.paths[self._idx]
-        self._idx += 1
-        raw = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
-        if raw is None:
-            return self.get_next()
-        canvas = preprocess_frame(
-            raw, self.cfg.data.img_h, self.cfg.data.img_w,
-            flat_field=self.flat_field,
-            apply_clahe=self.cfg.data.use_clahe,
-        )
-        t = canvas[np.newaxis, np.newaxis, :, :].astype(np.float32)
-        return {"input": t}
+        # Iterative, not recursive (F88): a directory of unreadable images
+        # used to recurse once per file and would hit RecursionError at a
+        # few thousand --calib-images.
+        while self._idx < len(self.paths):
+            p = self.paths[self._idx]
+            self._idx += 1
+            raw = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+            if raw is None:
+                print(f"  [calib] unreadable, skipped: {p}")
+                continue
+            canvas, _s, _px, _py = preprocess_frame(
+                raw, self.cfg.data.img_h, self.cfg.data.img_w,
+                clahe_enabled=self.cfg.aug.clahe_enabled,
+                clahe_clip=self.cfg.aug.clahe_clip,
+                clahe_grid=self.cfg.aug.clahe_grid,
+                flat_field=self.flat_field)
+            return {self.input_name:
+                    canvas[np.newaxis, np.newaxis, :, :].astype(np.float32)}
+        return None
 
 
 # ===========================================================================
-# scale sanity check
+# scale extraction
 # ===========================================================================
 
 def output_scales(model_path: str) -> Dict[str, float]:
-    """
-    Return {output_name: scale} for every DequantizeLinear in the graph.
-
-    In a QDQ graph the model output is produced by a DequantizeLinear whose
-    'scale' initialiser is the per-tensor quantisation scale. Extracting it
-    here lets us verify that off_pred and size_pred got independent scales.
-    """
+    """{DequantizeLinear output name: per-tensor scale}."""
     m = onnx.load(model_path)
     init_map = {i.name: i for i in m.graph.initializer}
     scales: Dict[str, float] = {}
     for node in m.graph.node:
-        if node.op_type != "DequantizeLinear":
-            continue
-        if len(node.input) < 2:
+        if node.op_type != "DequantizeLinear" or len(node.input) < 2:
             continue
         scale_init = init_map.get(node.input[1])
         if scale_init is None:
             continue
-        val = float(np.frombuffer(scale_init.raw_data, dtype=np.float32)[0])
-        # Use the output name as key so callers can match to blob names.
+        val = float(numpy_helper.to_array(scale_init).reshape(-1)[0])
         if node.output:
             scales[node.output[0]] = val
     return scales
+
+
+def _scale_for(scales: Dict[str, float], blob: str
+               ) -> Optional[Tuple[str, float]]:
+    """
+    Suffix-tolerant lookup (F90).
+
+    An exact-key match assumes ORT preserves graph output names through
+    quantisation; some paths append a suffix, and the strict lookup then
+    raised "the split did not survive" for a graph whose split is fine.
+    """
+    if blob in scales:
+        return blob, scales[blob]
+    cands = [k for k in scales
+             if k == blob or k.startswith(blob + "_") or k.endswith("/" + blob)]
+    if len(cands) == 1:
+        return cands[0], scales[cands[0]]
+    return None
+
+
+def verify_exclusions(out_path: str, exclude: List[str]) -> List[str]:
+    """
+    Confirm ORT honoured nodes_to_exclude (F86).
+
+    ORT silently ignores names that do not match the POST-preprocessing node
+    names, so the primary documented remediation for a failed accuracy gate
+    could be a no-op with no diagnostic.
+    """
+    if not exclude:
+        return
+    qm = onnx.load(out_path)
+    dq_out = {o for n in qm.graph.node
+              if n.op_type == "DequantizeLinear" for o in n.output}
+    still = []
+    for n in qm.graph.node:
+        if n.name in exclude and n.input and n.input[0] in dq_out:
+            still.append(n.name)
+    return still
 
 
 # ===========================================================================
@@ -134,23 +187,22 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description="INT8 QDQ quantization of the NIRDet-Lite ONNX graph.")
     ap.add_argument("--onnx", default=None,
-                    help="fp32 ONNX (default: cfg.export.onnx_sim_path if it "
-                         "exists, else cfg.export.onnx_path)")
+                    help="fp32 ONNX (default: cfg.export.onnx_sim_path)")
     ap.add_argument("--out", default=None,
                     help="output path (default: cfg.export.onnx_int8_path)")
     ap.add_argument("--profile", default=None)
     ap.add_argument("--calib-images", type=int, default=None)
     ap.add_argument("--method", default=None,
                     choices=["minmax", "percentile", "entropy"])
-    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--seed", type=int, default=None,
+                    help="override cfg.export.calib_seed")
     ap.add_argument("--exclude-first-conv", action="store_true",
-                    help="keep the single-channel NIR stem in float. This is "
-                         "the usual first fix when evaluate_onnx.py reports a "
-                         "drop above cfg.eval.int8_max_map50_drop: the stem "
-                         "sees a different input distribution from every "
-                         "other conv and is the common calibration outlier.")
+                    help="keep the convs that directly consume the graph "
+                         "input (the NIR stem and eaa.edge_conv) in float32")
     ap.add_argument("--exclude", nargs="*", default=[],
                     help="extra node names to leave in float32")
+    ap.add_argument("--keep-pre", action="store_true",
+                    help="keep the intermediate -pre.onnx graph")
     args = ap.parse_args()
 
     cfg = get_config()
@@ -169,80 +221,140 @@ def main() -> int:
 
     out_path = args.out or cfg.export.onnx_int8_path
     n_cal = args.calib_images or cfg.export.calib_images
+    # F09 (audit fix): the CLI overrides the config; the config is the
+    # fallback. Reading only args.method made cfg.export.calib_method a
+    # no-op field, and it silently defeated remediation step 2 that
+    # evaluate_onnx.py prints when the INT8 gate fails.
+    method = str(args.method or cfg.export.calib_method or "minmax").lower()
+    _CAL_METHODS = {"minmax": CalibrationMethod.MinMax,
+                    "percentile": CalibrationMethod.Percentile,
+                    "entropy": CalibrationMethod.Entropy}
+    if method not in _CAL_METHODS:
+        raise SystemExit(
+            f"unknown calibration method {method!r}; expected one of "
+            f"{sorted(_CAL_METHODS)} (from --method or cfg.export.calib_method)")
+    cal = _CAL_METHODS[method]
 
-    cal_method_map = {
-        "minmax": CalibrationMethod.MinMax,
-        "percentile": CalibrationMethod.Percentile,
-        "entropy": CalibrationMethod.Entropy,
-        None: CalibrationMethod.MinMax,
-    }
-    cal = cal_method_map[args.method]
-
-    flat_field = load_flat_field(cfg)
-    reader = NIRCalibrationReader(cfg, n_cal, seed=args.seed,
-                                  flat_field=flat_field)
+    flat_field = load_flat_field(cfg.aug.flat_field_path)
 
     extra: Dict = {}
     if cal == CalibrationMethod.Percentile:
-        extra["calibration_sampling_size"] = min(n_cal, 256)
+        # ORT's own key is "CalibPercentile"; some versions VALIDATE
+        # extra_options strictly, so passing both keys unconditionally could
+        # make --method percentile fail outright. Try the modern key, fall
+        # back on rejection (F87).
+        extra["CalibPercentile"] = float(cfg.export.calib_percentile)
+        print(f"[quant] percentile calibration: CalibPercentile="
+              f"{extra['CalibPercentile']} "
+              f"(cfg.export.calib_percentile)")
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".",
                 exist_ok=True)
 
-    # Symbolic shape inference + graph cleanup. quantize_static assumes every
-    # tensor has a known shape; skipping this silently leaves some activations
-    # unquantised, which shows up as SW_FLOAT layers in the stedgeai report.
     pre = os.path.splitext(fp32)[0] + "-pre.onnx"
     shape_inference.quant_pre_process(fp32, pre, skip_symbolic_shape=False)
     print(f"[quant] pre-processed -> {pre}")
 
+    in_name = graph_input_name(pre)
+    print(f"[quant] graph input: {in_name!r}")
+
+    reader = NIRCalibrationReader(cfg, n_cal, input_name=in_name,
+                                  seed=args.seed, flat_field=flat_field)
+
     exclude = list(args.exclude)
     if args.exclude_first_conv:
-        _m = onnx.load(pre)
-        for _n in _m.graph.node:
-            if _n.op_type == "Conv":
-                exclude.append(_n.name)
-                print(f"[quant] excluding first Conv from quantisation: "
-                      f"{_n.name}")
-                break
+        for conv_name in first_conv_names_on_input(pre, in_name):
+            exclude.append(conv_name)
+            print(f"[quant] excluding input Conv from quantisation: "
+                  f"{conv_name}")
 
     print(f"[quant] {fp32} -> {out_path}")
-    print(f"[quant] {n_cal} calibration images, method={args.method or 'minmax'}")
+    print(f"[quant] {n_cal} calibration images, method={method} "
+          f"(source: {'--method' if args.method else 'cfg.export.calib_method'})")
 
-    quantize_static(
-        model_input=pre,
-        model_output=out_path,
-        calibration_data_reader=reader,
-        quant_format=QuantFormat.QDQ,
-        per_channel=True,
-        weight_type=QuantType.QInt8,
-        activation_type=QuantType.QInt8,
-        calibrate_method=cal,
-        nodes_to_exclude=exclude or None,
-        extra_options=extra,
+    kwargs = dict(
+        model_input=pre, model_output=out_path,
+        calibration_data_reader=reader, quant_format=QuantFormat.QDQ,
+        per_channel=True, weight_type=QuantType.QInt8,
+        activation_type=QuantType.QInt8, calibrate_method=cal,
+        nodes_to_exclude=exclude or None, extra_options=extra,
     )
+    try:
+        quantize_static(**kwargs)
+    except (TypeError, ValueError) as exc:
+        if "CalibPercentile" not in str(exc):
+            raise
+        print(f"[quant] this onnxruntime rejects CalibPercentile ({exc}); "
+              f"retrying with the legacy 'percentile' key")
+        reader._idx = 0
+        kwargs["extra_options"] = {
+            "percentile": float(cfg.export.calib_percentile)}
+        quantize_static(**kwargs)
 
-    # Verify off_pred and size_pred got independent QDQ scales.
+    still = verify_exclusions(out_path, exclude)
+    if still:
+        raise RuntimeError(
+            f"nodes {sorted(set(still))} were requested excluded but appear "
+            f"quantised in {out_path} (their data input is fed by a "
+            f"DequantizeLinear). ORT matches node NAMES from the "
+            f"pre-processed graph; re-read them with "
+            f"first_conv_names_on_input(pre, in_name) and pass those exactly.")
+    if exclude:
+        print(f"[quant] verified {len(exclude)} node(s) left in float32")
+
     scales = output_scales(out_path)
-    off8_scales = [v for k, v in scales.items() if "off" in k.lower()]
-    size8_scales = [v for k, v in scales.items() if "size" in k.lower()]
-    print("\n[quant] output QDQ scales:")
+    # F83: these are ACTIVATION scales (per-tensor), not weight
+    # DQ scales. Per-channel weight scales are separate; do not read
+    # this table as the weight quantisation.
+    print("\n[quant] output QDQ activation scales (per-tensor):")
     for name, val in sorted(scales.items()):
         print(f"  {name}: {val:.6f}")
-    if off8_scales and size8_scales:
-        if abs(off8_scales[0] - size8_scales[0]) < 1e-9:
+
+    checked = 0
+    for s in cfg.model.strides:
+        off_key, size_key = f"off{s}", f"size{s}"
+        off = _scale_for(scales, off_key)
+        size = _scale_for(scales, size_key)
+        missing = [k for k, v in ((off_key, off), (size_key, size)) if v is None]
+        if missing:
             raise RuntimeError(
-                "off8 and size8 have IDENTICAL QDQ scales — the split "
-                "did not survive to the QDQ graph. Check that the ONNX "
-                "was exported with separate off_pred / size_pred convs "
-                "(test_decode_contract.t7 must PASS before quantising).")
-        print(f"\n[quant] off scale  {off8_scales[0]:.6f}  "
-              f"size scale {size8_scales[0]:.6f}  (must differ)")
+                f"QDQ output scale missing for {missing}. The off/size split "
+                f"did not survive to the QDQ graph. Check that the ONNX was "
+                f"exported with separate off_pred / size_pred convs "
+                f"(test_decode_contract t7 must PASS before quantising). "
+                f"Present keys: {sorted(scales)}")
+        (off_name, off_val), (size_name, size_val) = off, size
+        if abs(off_val - size_val) < 1e-9:
+            # F82: warn, do not abort. ORT may legitimately assign equal
+            # scales for very narrow off/size distributions; evaluate_onnx.py
+            # gates the real accuracy anyway.
+            print(f"[quant] WARNING: {off_name} and {size_name} have identical "
+                  f"QDQ scales ({off_val:.6f}). This usually means the off/size "
+                  f"split did not survive to the QDQ graph. Verify with "
+                  f"onnxruntime before proceeding.")
+        checked += 1
+        print(f"[quant] stride {s}: {off_name} scale {off_val:.6f}  "
+              f"{size_name} scale {size_val:.6f}  (expected to differ)")
+    if checked == 0:
+        raise RuntimeError(
+            f"off/size scale check ran on no strides — cfg.model.strides is "
+            f"empty: {cfg.model.strides!r}")
+
+    if args.keep_pre:
+        print(f"[quant] kept intermediate graph: {pre}")
+    else:
+        os.remove(pre)
+        print(f"[quant] removed intermediate graph: {pre}")
+
+    # The INT8 graph must carry its own contract, like every other artefact.
+    from export_onnx import write_contract_sidecar
+    write_contract_sidecar(cfg, out_path)
 
     print("=" * 62)
     print(f"  INT8 QDQ written to: {out_path}")
-    print(f"  A sanity check, not a gate: evaluate_onnx.py is the gate.")
-    print(f"  next: python evaluate_onnx.py --int8 {out_path}"
+    print("  A sanity check, not a gate: evaluate_onnx.py is the gate.")
+    print(f"  next: python evaluate_onnx.py --int8 {out_path} "
+          f"--fp32-ref {fp32}"
           + (f" --profile {args.profile}" if args.profile else ""))
     print("=" * 62)
     return 0

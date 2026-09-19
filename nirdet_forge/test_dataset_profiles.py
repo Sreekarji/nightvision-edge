@@ -18,6 +18,7 @@ import tempfile
 
 from config import STRIDES, get_config
 from dataset_profiles import (CanvasMismatchError, DatasetProfile,
+                              StaleProfileError, _fmt_thresh,
                               canvas_fingerprint, check_canvas,
                               label_fingerprint)
 
@@ -84,7 +85,9 @@ def t3_apply() -> None:
     print("\nT3  DatasetProfile.apply fills the config")
     cfg = get_config()
     p = _synthetic()
-    p.apply(cfg, verbose=False)
+    # verify=False: synthetic root "/nonexistent" — apply()'s own docstring
+    # prescribes this for unit tests with a synthetic root.
+    p.apply(cfg, verbose=False, verify=False)
     check(cfg.data.n_train == 261, f"n_train {cfg.data.n_train}")
     check(cfg.data.n_val == 160, f"n_val {cfg.data.n_val}")
     check(cfg.data.n_test == 165, f"n_test {cfg.data.n_test}")
@@ -131,7 +134,7 @@ def t4_check_canvas_raises() -> None:
 
     raised = False
     try:
-        _synthetic(384, 640).apply(get_config(), verbose=False)
+        _synthetic(384, 640).apply(get_config(), verbose=False, verify=False)
     except CanvasMismatchError:
         raised = True
     check(raised, "apply() runs check_canvas BEFORE writing any prior")
@@ -181,24 +184,32 @@ def t6_label_fingerprint() -> None:
 
 
 def t7_real_profile(path: str) -> None:
-    print(f"\nT7  real profile {path}")
+    print(f"\nT7  real profile")
+    if not path:
+        print("  SKIP  no --profile given (pass --profile <yaml> to test a real profile)")
+        return
     if not os.path.isfile(path):
-        print(f"  SKIP  not found")
+        print(f"  SKIP  {path} not found")
         return
     cfg = get_config()
     p = DatasetProfile.load(path)
     try:
         p.apply(cfg, verbose=False)
         check(True, f"applies cleanly at {cfg.data.img_h}x{cfg.data.img_w}")
-    except CanvasMismatchError as exc:
-        check(False, f"canvas mismatch: {str(exc).splitlines()[0]}")
+    except (CanvasMismatchError, StaleProfileError, NameError) as exc:
+        # NameError is a belt-and-braces catch: apply() -> verify_fresh() ->
+        # geometry_fingerprint() hits a missing-import bug (F10, fixed in
+        # dataset_profiles.py) which is NOT a CanvasMismatchError, and T7
+        # would otherwise crash with a traceback instead of reporting FAIL.
+        # Keep it so future import failures still surface as a clean FAIL.
+        check(False, f"apply raised {type(exc).__name__}: {str(exc).splitlines()[0]}")
         return
     check(p.n_train > 0 and p.n_train_boxes > 0,
           f"{p.n_train} train images, {p.n_train_boxes} boxes")
     check(0.0 < p.prior_w < 1.0 and 0.0 < p.prior_h < 1.0,
           f"priors w {p.prior_w:.6f} h {p.prior_h:.6f}")
-    check(0.0 < p.deploy_score_thresh < 1.0,
-          f"deploy_score_thresh {p.deploy_score_thresh:.3f}")
+    check(p.deploy_score_thresh is None or 0.0 < p.deploy_score_thresh < 1.0,
+          f"deploy_score_thresh {_fmt_thresh(p.deploy_score_thresh)}")
     tr = p.splits.get("train", {})
     if tr:
         print(f"        train: {tr.get('n_boxes')} boxes, "
@@ -209,7 +220,7 @@ def t7_real_profile(path: str) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--profile", default="datasets/miniNIRPed_261.yaml")
+    ap.add_argument("--profile", default=None)
     args = ap.parse_args()
 
     print("=" * 70)

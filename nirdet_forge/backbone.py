@@ -14,47 +14,35 @@ backbone.py — NIRBackbone (dense convolutions only)
 
 NO DEPTHWISE SEPARABLE CONVOLUTIONS
 -----------------------------------
-ST's Neural-ART table does list DEPTHWISE_CONV_2D as hardware-mapped, so the
-problem is not support, it is occupancy. ST's own kernel guidance states that
-a 1x1 kernel is handled efficiently only when the input channel count is
-N*(72..128) and the output channel count is M*(16..24), best M*24. A 64-channel
-pointwise convolution therefore leaves the four CONV accelerators substantially
-idle, and a 3x3 with groups=channels gives the array almost nothing to
-parallelise across. STResNet/STYOLO (arXiv:2601.05364), benchmarked on STM32N6
-silicon, rejected depthwise separable convolutions, fire modules, channel
-shuffle and squeeze-excitation as "often unsupported or inefficient on MCU/NPU
-hardware" and built "exclusively" from standard 3x3 and 1x1, reporting lower
-RAM (1.39 vs 2.01 MB) and lower latency (21.3 vs 22.4 ms) than MobileNetV2-1.0
-at comparable accuracy. On the Pi 5 Cortex-A76 the argument is different but
-points the same way: INT8 dense GEMM exploits SDOT, depthwise kernels are
-memory-bandwidth bound.
-
-So: every residual block is a plain ConvBNAct(ch, ch, k=3, p=1), every
-downsample is a strided dense 3x3, and base_ch drops 32 -> 24 to pay for it.
+Not a support question — ST lists DEPTHWISE_CONV_2D as hardware-mapped — but
+an occupancy one. A 3x3 with groups=channels gives the four CONV accelerators
+almost nothing to parallelise across, and on the Pi's Cortex-A76 depthwise
+kernels are memory-bandwidth bound while dense INT8 GEMM exploits SDOT.
+STResNet/STYOLO (arXiv:2601.05364) rejected depthwise separable convolutions
+and built exclusively from standard 3x3 and 1x1, reporting lower RAM
+(1.39 vs 2.01 MB) and lower latency (21.3 vs 22.4 ms) than MobileNetV2-1.0.
 
 STAGE WIDTH: base_ch * 4 = 96 EVERYWHERE
 ----------------------------------------
-Stages 3 and 4 used to emit 256 channels that the neck immediately projected
-to 64 with a 1x1 — three quarters of that computation was discarded. 96 is
-inside ST's 72..128 input-channel window for 1x1 kernels and is 4*24, an ideal
-output-channel multiple. It is also non-prime and a multiple of 8 (ST: "avoid
-using prime numbers as number of kernels/channels").
+96 is inside ST's 72..128 input-channel window for 1x1 kernels, is 4*24 (an
+ideal output-channel multiple), non-prime and a multiple of 8.
 
 STEM PROJECTION (STResNet/STYOLO section 5.3)
 ---------------------------------------------
 The stem emits only ``stem_ch`` channels on the stride-2 map — the largest
 tensor in the network — and width is recovered on the stride-4 map. STYOLO
-measured peak RAM 4.26 -> 2.46 MB (-42%) and latency 47.32 -> 42.99 ms for
-30.54 -> 30.12 mAP from exactly this change. The N6 falls off a cliff past
-~4 MB because it starts using external memory.
+measured peak RAM 4.26 -> 2.46 MB (-42%) from exactly this change.
 
 ACTIVATION / PADDING
 --------------------
-ReLU6 (ONNX Clip), which ST maps on hardware unconditionally. SiLU is not
-supported as a single ONNX operator at all; only the expanded form is, behind
-a compiler flag. Padding is zeros: ST maps Pad "partial - according to the
-parameters", and Pad <= 2 costs nothing, but reflect is the case that falls
-back to software.
+ReLU6 (ONNX Clip), unconditionally HW-mapped. Padding is zeros.
+
+ACTIVATION RANGE (resolved)
+---------------------------
+DenseResBlock.forward clamps x + out to [0, 6], preserving the ReLU6
+guarantee through residual connections. A two-block stage therefore also
+stays in [0, 6]. See attention.py RANGE LEDGER for how this propagates
+through EAA and the FPN.
 """
 
 from __future__ import annotations
@@ -65,6 +53,8 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from attention import _edge_templates_canonical
+
 
 # ---------------------------------------------------------------------------
 # Primitives
@@ -73,9 +63,8 @@ import torch.nn as nn
 class ConvBNAct(nn.Module):
     """Conv -> BatchNorm -> ReLU6. BN folds into the conv at export.
 
-    BatchNorm, never GroupNorm: Neural-ART has no GroupNorm mapping (it
-    decomposes into ReduceMean/Sqrt/Div, and Div with a runtime divisor is
-    SW_INT), and GN also blocks NCNN's BN-fusion pass.
+    BatchNorm, never GroupNorm: Neural-ART has no GroupNorm mapping, and GN
+    also blocks NCNN's BN-fusion pass.
     """
 
     def __init__(self, in_ch: int, out_ch: int, k: int = 3, s: int = 1,
@@ -95,10 +84,12 @@ class ConvBNAct(nn.Module):
 
 class DenseResBlock(nn.Module):
     """
-    Dense 3x3 residual block. This is the direct replacement for the old
-    _DWSResBlock: one full 3x3 convolution, no depthwise/pointwise split.
+    Dense 3x3 residual block: one full 3x3 convolution, no depthwise split.
 
     ``dilation`` is used only by the deepest stage.
+
+    Post-add clamp to [0, 6] ensures the residual output stays within the
+    ReLU6 contract. ONNX Clip, HW-mapped.
     """
 
     def __init__(self, ch: int, shortcut: bool = True, dilation: int = 1) -> None:
@@ -108,7 +99,14 @@ class DenseResBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.conv(x)
-        return x + out if self.shortcut else out
+        if not self.shortcut:
+            return out
+        # RANGE LEDGER: both x and out are in [0,6] after ReLU6. The unclamped
+        # add gives [0,12]; a two-block stage reaches [0,18], costing ~1.6 bits
+        # of INT8 resolution and compounding with EAA (attention.py range ledger).
+        # Clamp here, once, before the INT8 activation range is measured.
+        # ONNX Clip is unconditionally HW-mapped on Neural-ART and NCNN.
+        return torch.clamp(x + out, 0.0, 6.0)
 
 
 class CSPBlock(nn.Module):
@@ -116,9 +114,8 @@ class CSPBlock(nn.Module):
     x -> cv1(1x1, out/2) -> [dense 3x3 res] * n --.
       -> cv2(1x1, out/2) ------------------------ concat -> cv3(1x1, out)
 
-    ``dilate_last`` applies the dilation to the FINAL residual block only,
-    which is how the stride-32 stage gets its enlarged receptive field for
-    free. Concat is HW-mapped on Neural-ART.
+    ``dilate_last`` applies the dilation to the FINAL residual block only.
+    Concat is HW-mapped on Neural-ART.
     """
 
     def __init__(self, in_ch: int, out_ch: int, n: int = 1,
@@ -143,12 +140,7 @@ class CSPBlock(nn.Module):
 
 
 class StrideDown(nn.Module):
-    """Learnable 2x downsample: a single dense strided 3x3.
-
-    ST: stride 2 is one of the three efficient horizontal strides, and a 3x3
-    kernel is the recommended height/width. The previous implementation was
-    a strided depthwise 3x3 followed by a pointwise 1x1.
-    """
+    """Learnable 2x downsample: a single dense strided 3x3."""
 
     def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__()
@@ -166,13 +158,9 @@ class NIRStem(nn.Module):
     """
     Single-channel NIR entry conv, stride 2, zeros padding, NARROW output.
 
-    ``out_ch`` defaults to 16 (config.ModelCfg.stem_ch), not 32: this is the
-    largest activation tensor in the network and the STYOLO projection result
-    says the width is better spent one stage later.
-
-    The first ``n_edge_init`` filters are seeded with unit-L2 Sobel /
-    Laplacian kernels — 850 nm reflective NIR is an edge-rich, texture-poor
-    modality, so oriented gradients are the right inductive bias. The rest are
+    The first ``n_edge_init`` filters are seeded with Sobel / Laplacian
+    kernels — 850 nm reflective NIR is an edge-rich, texture-poor modality, so
+    oriented gradients are the right inductive bias. The rest are
     Kaiming-uniform. ``imagenet_slots`` reports which filter indices are free
     for channel-summed ImageNet transfer (see train.imagenet_stem_init).
     """
@@ -190,25 +178,25 @@ class NIRStem(nn.Module):
         self.act = nn.ReLU6(inplace=True)
         self._init_edge_kernels()
 
-    @staticmethod
-    def _edge_templates() -> List[torch.Tensor]:
-        Gx = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]])
-        Gy = Gx.T.contiguous()
-        G45 = torch.tensor([[0., 1., 2.], [-1., 0., 1.], [-2., -1., 0.]])
-        G135 = torch.tensor([[-2., -1., 0.], [-1., 0., 1.], [0., 1., 2.]])
-        Lap = torch.tensor([[0., -1., 0.], [-1., 4., -1.], [0., -1., 0.]])
-        LapD = torch.tensor([[-1., -1., -1.], [-1., 8., -1.], [-1., -1., -1.]])
-        out = []
-        for t in (Gx, Gy, G45, G135, Lap, LapD):
-            n = t.norm()
-            out.append(t / n if float(n) > 0 else t)
-        return out
-
     def _init_edge_kernels(self) -> None:
+        """
+        Kaiming the whole tensor, then overwrite the edge slots — RESCALED to
+        the std of the slots they replace (F6).
+
+        The templates are unit-L2 (L2 = 1.0) while a Kaiming slot with
+        a=sqrt(5) has L2 ~= 0.57, so seeding them raw pushed the edge filters
+        into the stem BatchNorm roughly 1.7x hotter than the random ones.
+        This is the same normalisation train.imagenet_stem_init already
+        applies to its own slots.
+        """
+        templates = _edge_templates_canonical()
         with torch.no_grad():
             nn.init.kaiming_uniform_(self.conv.weight, a=math.sqrt(5))
-            for i, t in enumerate(self._edge_templates()[: self.n_edge_init]):
-                self.conv.weight[i, 0] = t
+            ref_std = float(self.conv.weight.std())
+            for i, t in enumerate(templates[: self.n_edge_init]):
+                t_std = float(t.std())
+                scale = (ref_std / t_std) if t_std > 1e-12 else 1.0
+                self.conv.weight[i, 0] = t[0] * scale
 
     @property
     def imagenet_slots(self) -> Tuple[int, int]:
@@ -227,10 +215,10 @@ class NIRBackbone(nn.Module):
     """
     Returns (P3, P4, P5) at strides 8, 16, 32.
 
-    out_channels = (base_ch*4, base_ch*4, base_ch*4) = (96, 96, 96) at
-    base_ch=24. All three are equal on purpose: the neck projects every level
-    to a common width anyway, so a wider deep stage was paying for channels
-    that a 1x1 immediately discarded.
+    out_channels = (base_ch*4,) * 3 = (96, 96, 96) at base_ch=24. All three
+    are equal on purpose: the neck projects every level to a common width
+    anyway, so a wider deep stage was paying for channels that a 1x1
+    immediately discarded.
     """
 
     def __init__(self, base_ch: int = 24,
@@ -239,9 +227,14 @@ class NIRBackbone(nn.Module):
                  n_edge_init: int = 6,
                  p5_dilation: int = 2) -> None:
         super().__init__()
-        n_blocks = tuple(n_blocks) if n_blocks is not None else (1, 2, 2)
-        if len(n_blocks) != 3:
-            raise ValueError("n_blocks must have 3 entries (P2, P3, P4)")
+        n_blocks = tuple(n_blocks) if n_blocks is not None else (1, 2, 2, 1)
+        if len(n_blocks) not in (3, 4):
+            raise ValueError(
+                "n_blocks must have 3 or 4 entries: (stride-4, stride-8, stride-16) "
+                "plus an optional 4th for the stride-32 stage (default 1). "
+                "The stride-32 stage is fixed at depth 1 when 3 entries are given.")
+        if len(n_blocks) == 3:
+            n_blocks = n_blocks + (1,)
         if base_ch % 8:
             raise ValueError(f"base_ch should be a multiple of 8 for clean "
                              f"channel splitting on Neural-ART, got {base_ch}")
@@ -267,9 +260,8 @@ class NIRBackbone(nn.Module):
         self.down4 = StrideDown(c_out, c_out)
         # P5 is a semantic context level, not a counting level: depth 1, but
         # the single block is dilated so it sees roughly twice the spatial
-        # extent. Free in parameters and MACs; ST supports dilation and only
-        # warns against LARGE factors.
-        self.stage4 = CSPBlock(c_out, c_out, n=1,
+        # extent. Free in parameters and MACs.
+        self.stage4 = CSPBlock(c_out, c_out, n=n_blocks[3],
                                dilate_last=self.p5_dilation)
 
         self.out_channels: Tuple[int, int, int] = (c_out, c_out, c_out)
@@ -295,3 +287,23 @@ if __name__ == "__main__":
                if isinstance(mod, nn.Conv2d) and mod.groups > 1)
     print("grouped/depthwise convs:", n_dw, "(must be 0)")
     assert n_dw == 0
+
+    # F6: the seeded edge filters must enter the BatchNorm at the same
+    # magnitude as the Kaiming slots they sit beside.
+    s = NIRStem(out_ch=16, n_edge_init=6)
+    edge_std = float(s.conv.weight[:6].std())
+    rand_std = float(s.conv.weight[6:].std())
+    ratio = edge_std / rand_std
+    print(f"stem std: edge slots {edge_std:.5f} vs random slots "
+          f"{rand_std:.5f}  ratio {ratio:.3f} (want ~1.0)")
+    assert 0.8 < ratio < 1.25, \
+        f"edge/random std ratio {ratio:.3f} outside [0.8, 1.25]; " \
+        f"NIRStem._init_edge_kernels rescaling is broken"
+    # Also verify every template is zero-mean (non-zero-mean templates like a
+    # box filter would make the ratio test pass trivially).
+    for i, t in enumerate(_edge_templates_canonical()[: s.n_edge_init]):
+        mean_abs = float(t.mean().abs())
+        assert mean_abs < 1e-5, \
+            f"template {i} has non-zero mean {mean_abs:.2e}; " \
+            f"the std ratio test is not sensitive to mean shifts"
+    print("stem std assertions passed")

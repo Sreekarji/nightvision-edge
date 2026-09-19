@@ -49,6 +49,7 @@ import json
 import math
 import os
 import random
+import sys
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -57,7 +58,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from config import Config, ema_tau_for, get_config, validate_config
+from config import (CKPT_DEPLOY_KEY, CKPT_EMA_KEY, CKPT_LIVE_KEY, Config,
+                    ema_tau_for, get_config, validate_config)
 from dataset import build_dataloader
 from losses import ColdStartError, NIRDetLoss
 from model import NIRDet, build_nirdet
@@ -69,21 +71,32 @@ from model import NIRDet, build_nirdet
 #                   the EMA shadow when EMA is enabled and the live weights
 #                   otherwise, so evaluate.py / export_onnx.py never have to
 #                   know which mode the run used.
-CKPT_LIVE_KEY = "model"
-CKPT_EMA_KEY = "model_ema"
-CKPT_DEPLOY_KEY = "deploy_state_dict"
+# (All three are defined once in config.py — the single source of truth.)
 
 
 # ===========================================================================
 # determinism
 # ===========================================================================
 
-def set_seed(seed: int) -> None:
+def set_seed(seed: int, deterministic: bool = False) -> None:
+    """
+    Seed python / numpy / torch / CUDA.
+
+    NOTE on reproducibility: cudnn.benchmark=True (the default here for
+    throughput) selects convolution algorithms by TIMING, which is
+    nondeterministic run-to-run even under a fixed seed. Fully reproducible
+    runs need --deterministic, which disables benchmark and switches torch
+    to deterministic algorithms.
+    """
     random.seed(seed)
     np.random.seed(seed % (2 ** 32 - 1))
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = True
+    if deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True)
+    else:
+        torch.backends.cudnn.benchmark = True
 
 
 # ===========================================================================
@@ -123,14 +136,17 @@ def build_param_groups(model: nn.Module, cfg: Config) -> List[dict]:
     }
 
     for name, p in model.named_parameters():
-        if not p.requires_grad:
-            # EAA edge kernels during the freeze window. They are re-enabled by
-            # eaa._update_grad_state(), and because the optimiser groups are
-            # built once, they must still be registered. Register them in the
-            # correct bucket regardless of the current flag.
-            pass
+        # EAA edge kernels during the freeze window are registered here too:
+        # they are re-enabled by eaa._update_grad_state(), and because the
+        # optimiser groups are built once, they must sit in their bucket
+        # regardless of the current requires_grad flag.
         sec = _section_of(name)
-        decay = p.ndim > 1        # conv/linear weights only
+        if "eaa.proj.weight" in name:
+            decay = False   # override: proj.weight carries the calibrated gain k;
+                            # weight decay would pull k back toward 1/N and re-inert
+                            # the EAA gate (see attention.py calibrate_bias docstring)
+        else:
+            decay = p.ndim > 1        # conv/linear weights only
         buckets[(sec, decay)].append(p)
 
     groups: List[dict] = []
@@ -191,13 +207,14 @@ class LRSchedule:
         self.lr_min = float(cfg.train.lr_min)
         self.flat = bool(flat)
 
-        # cfg.train.warmup_steps is a TARGET in steps, and it is NOT
-        # dataset-size-invariant: 300 steps is ~9 epochs at 261 images /
-        # batch 8 but a fraction of one epoch on full NIRPed. Cap it at 10% of
-        # the run so a small dataset does not spend a tenth of training below
-        # its peak LR, and a large one still gets a real warmup.
+        # F14: warmup is DERIVED from warmup_epochs_frac — a fraction of the
+        # total run, so it is dataset-size-invariant. Cap at 10% of the run so
+        # a small dataset does not spend a disproportionate time below peak
+        # LR, and a large one still gets a real warmup.
+        derived = round(float(cfg.train.warmup_epochs_frac) *
+                        float(cfg.train.epochs) * max(1, steps_per_epoch))
         self.warmup = 0 if flat else min(
-            int(cfg.train.warmup_steps),
+            derived,
             int(float(cfg.train.epochs) * 0.1 * max(1, steps_per_epoch)),
         )
         self.warmup = max(0, self.warmup)
@@ -381,6 +398,9 @@ def save_checkpoint(path: str, model: NIRDet, ema: Optional[ModelEMA],
         # invalidate a trained checkpoint.
         "deploy_contract_hash": cfg.deploy_contract()["hash"],
         "deploy_contract": cfg.deploy_contract(),
+        # F30: dump the full config as JSON beside every checkpoint so a
+        # future reader can reconstruct the exact training conditions.
+        "cfg_json": json.dumps(cfg.to_dict(), indent=2),
         "eaa_proj_bias": cfg.model.eaa_proj_bias,
         "strides": list(cfg.model.strides),
     }
@@ -391,9 +411,138 @@ def save_checkpoint(path: str, model: NIRDet, ema: Optional[ModelEMA],
     os.replace(tmp, path)
 
 
+def save_history(ckpt_dir: str, history: list) -> None:
+    """Atomic history.json write — a crash, ColdStartError return or Ctrl-C
+    mid-run must not leave evaluate.py without its per-level n_pos record."""
+    path = os.path.join(ckpt_dir, "history.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(history, fh, indent=2)
+    os.replace(tmp, path)
+
+
 # ===========================================================================
 # one epoch
 # ===========================================================================
+
+# ===========================================================================
+# live-output helpers  (#25, #82, session header/footer)
+# ===========================================================================
+
+_BAR_W = 20
+
+
+def _sci(x: float) -> str:
+    """LR in scientific notation, 2 sig figs: 0.0012 -> '1.2e-3'."""
+    s = f"{x:.1e}"
+    m, e = s.split("e")
+    return f"{m}e{int(e)}"
+
+
+def _dur(seconds: float) -> str:
+    """Compact duration: 272 -> '4m32s', 9660 -> '2h41m', 8 -> '8s'."""
+    s = int(round(seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{sec:02d}s"
+    return f"{sec}s"
+
+
+def _bar(frac: float, w: int = _BAR_W) -> str:
+    frac = max(0.0, min(1.0, frac))
+    fill = int(round(frac * w))
+    return "▓" * fill + "░" * (w - fill)
+
+
+class _Tee:
+    """Mirror everything written to stdout into a log file."""
+
+    def __init__(self, log_path: str) -> None:
+        self._term = sys.stdout
+        self._log = open(log_path, "a", buffering=1, encoding="utf-8")
+
+    def write(self, data: str) -> None:
+        self._term.write(data)
+        # don't write bare \r frames to the log — convert to newlines
+        self._log.write(data.replace("\r", "\n") if data.endswith("\r") else data)
+
+    def flush(self) -> None:
+        self._term.flush()
+        self._log.flush()
+
+    def close(self) -> None:
+        try:
+            self._log.close()
+        except Exception:
+            pass
+
+
+def write_curves(history: list, ckpt_dir: str, best_epoch: Optional[int]) -> None:
+    """Write a 2-panel loss+mAP50 PNG after every epoch. (#82)
+
+    Guarded by ImportError so matplotlib absence never crashes training.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+    if not history:
+        return
+    ep = [h.get("epoch", i + 1) for i, h in enumerate(history)]
+    fig, (ax0, ax1) = plt.subplots(2, 1, sharex=True, figsize=(9, 6))
+    for k, lbl in (("total", "total"), ("cls", "cls"),
+                   ("reg", "reg"), ("iou", "iou")):
+        vals = [h.get(k, float("nan")) for h in history]
+        ax0.plot(ep, vals, label=lbl)
+    ax0.set_ylabel("train loss")
+    ax0.legend(loc="upper right")
+    ax0.grid(alpha=0.3)
+    map_vals = [h.get("val_map50", float("nan")) for h in history]
+    ax1.plot(ep, map_vals, color="tab:green", label="val mAP50")
+    ax1.set_ylabel("val mAP50")
+    ax1.set_xlabel("epoch")
+    ax1.legend(loc="lower right")
+    ax1.grid(alpha=0.3)
+    if best_epoch is not None:
+        for ax in (ax0, ax1):
+            ax.axvline(best_epoch, ls="--", color="crimson", alpha=0.7,
+                       label=f"best e{best_epoch}")
+    fig.tight_layout()
+    out = os.path.join(ckpt_dir, "curves.png")
+    fig.savefig(out, dpi=110)
+    plt.close(fig)
+
+
+def print_session_header(run_id: str, device: str, epochs: int,
+                         canvas_h: int, canvas_w: int, n_cells: int,
+                         torch_ver: str, contract_hash: str) -> None:
+    rows = [
+        f"NIRDet-Lite  |  run: {run_id}  |  {device}",
+        f"epochs: {epochs}  |  canvas: {canvas_h}x{canvas_w}"
+        f"  |  cells: {n_cells}",
+        f"torch: {torch_ver}  |  contract: {contract_hash[:8]}",
+    ]
+    w = max(len(r) for r in rows) + 2
+    print("╔" + "═" * (w + 1) + "╗")
+    for r in rows:
+        print(f"║ {r.ljust(w)}║")
+    print("╚" + "═" * (w + 1) + "╝")
+
+
+def print_session_footer(best_map50: float, best_epoch: int,
+                         best_path: str) -> None:
+    line = "═" * 60
+    print(line)
+    print(f"DONE  best mAP50 {best_map50:.4f} @ epoch {best_epoch}")
+    print(f"to evaluate:  python evaluate.py --checkpoint {best_path}")
+    print(line)
+
+
 
 def train_one_epoch(model: NIRDet, loader: DataLoader,
                     criterion: NIRDetLoss, opt: torch.optim.Optimizer,
@@ -411,7 +560,7 @@ def train_one_epoch(model: NIRDet, loader: DataLoader,
     n_batches = 0
     n_nonfinite = 0
     t0 = time.time()
-    lr_now = float(opt.param_groups[0]["lr"])
+    lr_now = 0.0   # first real value assigned by sched.apply() on first batch
 
     for bi, (imgs, targets, _meta) in enumerate(loader):
         imgs = imgs.to(device, non_blocking=True)
@@ -461,22 +610,48 @@ def train_one_epoch(model: NIRDet, loader: DataLoader,
             if k in out:
                 acc[k] += float(out[k].detach())
 
-        if log_every and (bi % log_every == 0):
-            per_lvl = "  ".join(
-                f"l{l}={float(out.get(f'n_pos_l{l}', 0.0)):.0f}"
-                for l in range(n_levels))
-            print(f"  e{epoch:03d} b{bi:04d}/{len(loader):04d} "
-                  f"loss {float(out['total']):.4f} "
-                  f"cls {float(out['cls']):.4f} reg {float(out['reg']):.4f} "
-                  f"iou {float(out['iou']):.3f} "
-                  f"n_pos {float(out['n_pos']):.0f} [{per_lvl}] "
-                  f"lr {lr_now:.2e}")
+        if log_every and (bi % log_every == 0 or bi == len(loader) - 1):
+            done = bi + 1
+            total = len(loader)
+            elapsed = time.time() - t0
+            rate = elapsed / done
+            eta = _dur(rate * (total - done))
+            print(f"\r[{epoch + 1:03d}/{cfg.train.epochs:03d}]"
+                  f" {_bar(done / total)}"
+                  f" {done:>{len(str(total))}d}/{total}"
+                  f"  loss {float(out['total']):.4f}"
+                  f"  cls {float(out['cls']):.4f}"
+                  f"  reg {float(out['reg']):.4f}"
+                  f"  iou {float(out['iou']):.4f}"
+                  f"  n_pos {float(out['n_pos']):.0f}"
+                  f"  lr {_sci(lr_now)}"
+                  f"  ETA {eta}",
+                  end="", flush=True)
+
+    print()   # close the \r progress line
 
     if n_batches == 0:
-        raise RuntimeError("train loader produced zero batches")
+        if n_nonfinite == 0:
+            raise RuntimeError("train loader produced zero batches")
+        raise RuntimeError(
+            f"no usable batches: all {n_nonfinite} batches were non-finite")
+    # F66: per-epoch norm-floor abort. The counter is incremented in
+    # NIRDetLoss.forward; consume and reset it here, after the batch loop.
+    if hasattr(criterion, "_norm_floor_count"):
+        nf = criterion._norm_floor_count
+        criterion._norm_floor_count = 0
+        if nf > int(cfg.loss.norm_floor_abort_thresh):
+            raise RuntimeError(
+                f"epoch {epoch}: norm was floored (sum < 1) on {nf} of "
+                f"{n_batches} batches (>{cfg.loss.norm_floor_abort_thresh}). "
+                f"The model is not assigning any positives. Check the dataset "
+                f"profile and that head.size_pred.bias was initialised correctly.")
+        if nf > 0:
+            print(f"  [loss] norm floored on {nf}/{n_batches} batches this epoch")
     stats = {k: v / n_batches for k, v in acc.items()}
     stats["lr"] = lr_now
     stats["secs"] = time.time() - t0
+    stats["n_nonfinite"] = n_nonfinite
     return stats, global_step
 
 
@@ -505,6 +680,14 @@ def parse_args() -> argparse.Namespace:
                          "one-line P5 utilisation experiment.")
     ap.add_argument("--no-ema", action="store_true")
     ap.add_argument("--no-eval", action="store_true")
+    ap.add_argument("--allow-no-profile", action="store_true",
+                    help="override the fail-safe that refuses >5-epoch runs "
+                         "without a dataset profile")
+    ap.add_argument("--deterministic", action="store_true",
+                    help="cudnn.benchmark off + deterministic algorithms. "
+                         "Without this, benchmark selects conv algorithms "
+                         "by timing and runs are not bit-reproducible even "
+                         "under a fixed seed.")
     ap.add_argument("--log-every", type=int, default=20)
     return ap.parse_args()
 
@@ -513,14 +696,13 @@ def main() -> int:
     args = parse_args()
     cfg = get_config()
 
-    # ---- 1. strides first: everything downstream is built from them ----
-    if args.p5_ablate:
-        cfg.model.strides = (8, 16)
-        print("[ablate] strides -> (8, 16); the stride-32 level is removed "
-              "from the head and the loss geometry. Compare mAP50 and the "
-              "n_pos_l2 history of the baseline run.")
-
-    # ---- 2. dataset profile: priors must exist before the model ----
+    # ---- 1. dataset profile FIRST. The profile's canvas fingerprint covers
+    # ITS OWN stride list, so check_canvas must see the unablated strides.
+    # prior_w/prior_h are canvas-space box medians and are stride-independent,
+    # so applying the profile before the ablation is sound — after is not
+    # (F01: --p5-ablate used to die with CanvasMismatchError on every
+    # profile, because test_dataset_profiles.t1 deliberately pins that a
+    # dropped stride changes the fingerprint).
     profile = None
     profile_path = args.profile
     if profile_path:
@@ -528,9 +710,29 @@ def main() -> int:
         profile = DatasetProfile.load(profile_path)
         profile.apply(cfg)          # raises CanvasMismatchError on mismatch
     else:
-        print("[warn] no --profile given: prior_w/prior_h, n_train_boxes "
-              "(copy_paste_p) and deploy_score_thresh fall back to the "
-              "config defaults. Generate one with dataset_profiles.py.")
+        print("\n" + "!" * 74)
+        print("  NO --profile GIVEN")
+        print("!" * 74)
+        print(f"  prior_w = {cfg.model.prior_w}   prior_h = {cfg.model.prior_h}")
+        print("  These are CONFIG FALLBACKS. A prior from a different dataset")
+        print("  produces a plausible loss curve with a useless regression branch.")
+        print("  Generate one:")
+        print("    python dataset_profiles.py --root <path> --out datasets/<n>.yaml")
+        print("!" * 74 + "\n")
+        if int(cfg.train.epochs) > 5 and not args.allow_no_profile \
+                and not args.overfit_test:
+            raise SystemExit(
+                f"refusing to start a {cfg.train.epochs}-epoch run without a "
+                f"dataset profile. Pass --profile <yaml>, or "
+                f"--allow-no-profile to override.")
+
+    # ---- 2. strides: still before the model, the loss geometry and the
+    # deploy-contract hash are built from them.
+    if args.p5_ablate:
+        cfg.model.strides = (8, 16)
+        print("[ablate] strides -> (8, 16); the stride-32 level is removed "
+              "from the head and the loss geometry. Compare mAP50 and the "
+              "n_pos_l2 history of the baseline run.")
 
     if args.epochs is not None:
         cfg.train.epochs = int(args.epochs)
@@ -543,9 +745,9 @@ def main() -> int:
     if args.no_ema:
         cfg.train.use_ema = False
     if args.overfit_test:
-        cfg.train.epochs = min(100, max(1, int(cfg.train.epochs)))
+        # Set BEFORE the no-profile epoch guard so --overfit-test never
+        # triggers it. An overfit smoke test does not need a dataset profile.
         cfg.train.epochs = 100
-        cfg.eval.val_interval = 1 if hasattr(cfg.eval, "val_interval") else 1
         cfg.train.val_interval = 1
         cfg.train.es_enabled = False
 
@@ -554,8 +756,9 @@ def main() -> int:
 
     device = torch.device(args.device or
                           ("cuda" if torch.cuda.is_available() else "cpu"))
-    set_seed(int(cfg.train.seed))
-    print(f"[env] device {device}  torch {torch.__version__}")
+    set_seed(int(cfg.train.seed), deterministic=bool(args.deterministic))
+    print(f"[env] device {device}  torch {torch.__version__}"
+          + ("  [deterministic]" if args.deterministic else ""))
 
     # ---- data ----
     train_loader, train_ds = build_dataloader(
@@ -598,26 +801,62 @@ def main() -> int:
         raise RuntimeError("grouped/depthwise convolution present; "
                            "backbone.py forbids them")
 
-    # ---- 5. EAA CALIBRATION on the first real batch ----
+    # ---- 5. EAA CALIBRATION on a dedicated unaugmented loader ----
     # Before epoch 0, before any optimiser step, before the edge kernels
     # unfreeze. The bias depends on the sensor, the 850 nm beam profile, the
     # flat-field map and the CLAHE settings, so it can only be measured here.
-    first_batch = next(iter(train_loader))
-    calib_imgs = first_batch[0].to(device)
+    # A dedicated loader, NOT iter(train_loader): (a) the training loader is
+    # augmented, so the measured edge statistics would include cutout, blur
+    # and copy-paste noise the Pi never sees, and (b) pulling a batch from a
+    # persistent-worker loader spawns the full worker pool and abandons it —
+    # a documented source of hangs on Windows.
+    # F07: measure cfg.train.eaa_calib_frames (>= 32) frames, not one batch.
+    # shuffle=True because a fixed-mount NIR capture stores temporally
+    # consecutive frames: the first N sorted files are one scene under one
+    # illuminator geometry — the worst estimator for a statistic that is
+    # frozen into proj.bias AND the INT8 activation ranges.
+    calib_target = max(1, int(getattr(cfg.train, "eaa_calib_frames", 32)))
+    calib_bs = max(1, min(8, int(cfg.train.batch_size)))
+    calib_loader, _calib_ds = build_dataloader(
+        cfg, "train", batch_size=calib_bs, shuffle=True,
+        augment=False, num_workers=0,
+        limit=10 if args.overfit_test else None)
+    _calib_chunks: List[torch.Tensor] = []
+    _calib_have = 0
+    for _c_imgs, _c_tgt, _c_meta in calib_loader:
+        _calib_chunks.append(_c_imgs)
+        _calib_have += int(_c_imgs.shape[0])
+        if _calib_have >= calib_target:
+            break
+    if not _calib_chunks:
+        raise RuntimeError("EAA calibration loader produced zero batches")
+    calib_imgs = torch.cat(_calib_chunks, 0)[:calib_target].to(device)
+    del _calib_chunks
+    print(f"[eaa] calibrating on {int(calib_imgs.shape[0])} unaugmented "
+          f"frame(s) (cfg.train.eaa_calib_frames={calib_target})")
     model.eval()
-    bias = model.calibrate_eaa(calib_imgs, force=False, verbose=True)
-    if bias is not None:
-        cfg.model.eaa_proj_bias = float(bias)
-        print(f"[eaa] cfg.model.eaa_proj_bias <- {cfg.model.eaa_proj_bias:+.5f} "
-              f"(goes into every checkpoint)")
-    elif cfg.model.eaa_proj_bias is None:
-        cfg.model.eaa_proj_bias = float(model.eaa.proj_bias_value)
-    if not model.eaa.is_calibrated:
-        raise RuntimeError(
-            "EAA calibration did not run. Without it the spatial gate is a "
-            "near-uniform rescale that the following BatchNorm absorbs "
-            "entirely, and the whole module contributes nothing.")
-    del calib_imgs, first_batch
+    # Skip calibration on --resume: the checkpoint's state_dict (loaded below)
+    # already carries calibrated proj.weight / proj.bias, and running
+    # calibrate_eaa here mutates both before they are overwritten by
+    # load_state_dict — wasted work and a misleading log line. The checkpoint
+    # also carries eaa_proj_bias in its cfg dict, so cfg stays consistent.
+    if not args.resume:
+        bias = model.calibrate_eaa(calib_imgs, force=False, verbose=True)
+        if bias is not None:
+            cfg.model.eaa_proj_bias = float(bias)
+            print(f"[eaa] cfg.model.eaa_proj_bias <- {cfg.model.eaa_proj_bias:+.5f} "
+                  f"(goes into every checkpoint)")
+        elif cfg.model.eaa_proj_bias is None:
+            cfg.model.eaa_proj_bias = float(model.eaa.proj_bias_value)
+        if not model.eaa.is_calibrated:
+            raise RuntimeError(
+                "EAA calibration did not run. Without it the spatial gate is a "
+                "near-uniform rescale that the following BatchNorm absorbs "
+                "entirely, and the whole module contributes nothing.")
+    else:
+        print("[eaa] --resume: skipping calibration; checkpoint carries "
+              "calibrated proj weights (eaa_proj_bias will be read from ck below)")
+    del calib_imgs, calib_loader, _calib_ds
     model.train()
 
     # ---- loss / optim ----
@@ -628,6 +867,7 @@ def main() -> int:
         qfl_beta=cfg.loss.qfl_beta, qfl_alpha=cfg.loss.qfl_alpha,
         tal_topk=cfg.loss.tal_topk, tal_alpha=cfg.loss.tal_alpha,
         tal_beta=cfg.loss.tal_beta, ramp_frac=cfg.loss.ramp_frac,
+        tal_min_pos_target=float(getattr(cfg.loss, "tal_min_pos_target", 0.10)),
         total_epochs=cfg.train.epochs, assert_cold_start=True,
     ).to(device)
 
@@ -636,9 +876,9 @@ def main() -> int:
     print(f"[sched] steps/epoch {steps_per_epoch}  total "
           f"{sched.total}  warmup {sched.warmup}"
           f"{'  (FLAT, overfit test)' if sched.flat else ''}")
-    print(f"[sched] warmup was rescaled from the cfg target "
-          f"{cfg.train.warmup_steps} to {sched.warmup} = min(target, 10% of "
-          f"the run). cfg.train.warmup_steps is NOT dataset-size-invariant.")
+    print(f"[sched] warmup rescaled from cfg target "
+          f"warmup_epochs_frac={cfg.train.warmup_epochs_frac:.3f} "
+          f"-> {sched.warmup} steps = min(derived, 10% of run).")
 
     ema = None
     if cfg.train.use_ema:
@@ -662,7 +902,15 @@ def main() -> int:
     best_map50 = -1.0
     history: List[dict] = []
     if args.resume:
-        ck = torch.load(args.resume, map_location=device, weights_only=False)
+        # F30: prefer weights_only=True; fall back loudly for older
+        # checkpoints that embed non-tensor objects (history list, cfg dict).
+        try:
+            ck = torch.load(args.resume, map_location=device, weights_only=True)
+        except Exception:
+            print(f"[resume] WARNING: weights_only=True failed for {args.resume}; "
+                  f"falling back to weights_only=False. This checkpoint may contain "
+                  f"arbitrary Python objects. Verify it came from this codebase.")
+            ck = torch.load(args.resume, map_location=device, weights_only=False)
         got = str(ck.get("deploy_contract_hash", ""))
         want = cfg.deploy_contract()["hash"]
         if got and got != want:
@@ -674,6 +922,9 @@ def main() -> int:
         model.load_state_dict(ck[CKPT_LIVE_KEY])
         if ema is not None and ck.get(CKPT_EMA_KEY):
             ema.load_state_dict(ck[CKPT_EMA_KEY])
+        elif ema is not None:
+            ema.shadow = {k: v.detach().clone().float()
+                          for k, v in model.state_dict().items()}
         if "optimizer" in ck:
             opt.load_state_dict(ck["optimizer"])
         start_epoch = int(ck.get("epoch", -1)) + 1
@@ -690,21 +941,50 @@ def main() -> int:
               f"best_map50 {best_map50:.4f} "
               f"eaa frozen={model.eaa.edges_frozen}")
 
-    ckpt_dir = cfg.train.checkpoint_dir
+    import datetime as _dt
+    _run_id = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    ckpt_dir = os.path.join(cfg.train.checkpoint_dir, f"run_{_run_id}")
     os.makedirs(ckpt_dir, exist_ok=True)
     last_path = os.path.join(ckpt_dir, "last.pth")
     best_path = os.path.join(ckpt_dir, "best.pth")
 
+    # #25: Tee stdout to ckpt_dir/train.log
+    _tee = _Tee(os.path.join(ckpt_dir, "train.log"))
+    sys.stdout = _tee
+    print(_dt.datetime.now().isoformat(timespec="seconds")
+          + "  cmd: " + " ".join(sys.argv))
+    print(f"torch {torch.__version__}  "
+          f"cuda {torch.cuda.is_available()}  device {device}")
+
     val_every = 1 if args.overfit_test else max(1, int(cfg.train.val_interval))
     epochs_no_improve = 0
+    _best_epoch = 0
 
-    print("=" * 70)
-    print(f"  training {cfg.train.epochs} epochs, strides "
-          f"{cfg.model.strides}, contract {cfg.deploy_contract()['hash']}")
-    print("=" * 70)
+    _contract = cfg.deploy_contract()
+    print_session_header(
+        run_id=_run_id,
+        device=str(device),
+        epochs=int(cfg.train.epochs),
+        canvas_h=int(cfg.data.img_h),
+        canvas_w=int(cfg.data.img_w),
+        n_cells=getattr(cfg, "num_cells", sum(
+            (cfg.data.img_h // s) * (cfg.data.img_w // s)
+            for s in cfg.model.strides)),
+        torch_ver=torch.__version__,
+        contract_hash=_contract["hash"],
+    )
 
     for epoch in range(start_epoch, int(cfg.train.epochs)):
         criterion.set_epoch(epoch)
+        # Per-epoch augmentation reseed (F17): with persistent workers the
+        # worker torch seed is fixed for the whole run, so without this the
+        # epoch term in the per-sample seed never advances and every epoch
+        # replays identical augmentation draws.
+        train_ds.set_epoch(epoch)
+        # Re-seed the shuffle generator so batch order varies per epoch
+        # independently of the per-sample augmentation seed (F17).
+        train_loader._nirdet_shuffle_generator.manual_seed(
+            int(cfg.train.seed) * 10_000 + epoch)
         try:
             stats, global_step = train_one_epoch(
                 model, train_loader, criterion, opt, sched, cfg, device,
@@ -714,6 +994,9 @@ def main() -> int:
             print("\n" + "!" * 70)
             print(exc)
             print("!" * 70)
+            if isinstance(sys.stdout, _Tee):
+                sys.stdout = sys.stdout._term
+                sys.stdout.flush()
             return 2
 
         n_levels = len(cfg.model.strides)
@@ -727,36 +1010,56 @@ def main() -> int:
 
         rec = {"epoch": epoch, **{k: float(v) for k, v in stats.items()}}
 
+        # F54: log per-level size bias so a drifting or dead level is
+        # immediately visible.
+        for lvl, s in enumerate(cfg.model.strides):
+            b = model.head.size_pred[lvl].bias.detach().cpu()
+            print(f"  size bias L{lvl} (stride {s}): "
+                  f"w exp {float(b[0].exp()):.4f}  h exp {float(b[1].exp()):.4f}  "
+                  f"(init {cfg.model.prior_w:.4f}/{cfg.model.prior_h:.4f})")
+
         # ---- validation on the SELECTION split ----
         if val_loader is not None and ((epoch + 1) % val_every == 0 or
                                        epoch == cfg.train.epochs - 1):
             from evaluate import evaluate_split     # lazy: breaks the cycle
-            eval_model = model
             restore = None
             if ema is not None:
                 restore = copy.deepcopy(model.state_dict())
                 model.load_state_dict(ema.deploy_state_dict(model))
-            metrics, _cache = evaluate_split(
-                eval_model, val_loader, cfg, device=device,
-                score_thresh=cfg.eval.eval_score_thresh, detailed=False)
-            if restore is not None:
-                model.load_state_dict(restore)
+            # F28: an exception during validation must not leave the live
+            # model holding EMA weights for the rest of training.
+            _t_val_start = time.time()
+            try:
+                metrics, _cache = evaluate_split(
+                    model, val_loader, cfg, device=device,
+                    score_thresh=cfg.eval.eval_score_thresh, detailed=False)
+            finally:
+                if restore is not None:
+                    model.load_state_dict(restore)
+            _val_time = time.time() - _t_val_start
 
             map50 = float(metrics.get("map_50", 0.0))
             rec["val_map50"] = map50
-            print(f"[epoch {epoch:03d}] {cfg.eval.select_split} mAP50 "
-                  f"{map50:.4f}  (best {max(best_map50, 0.0):.4f})")
 
-            # Improvement is decided BEFORE best_map50 moves. Computing the
-            # flag after the update makes it trivially false and silently
-            # disables early stopping.
-            improved = map50 > best_map50
+            # Improvement is decided BEFORE best_map50 moves.
+            improved = map50 > max(best_map50, 0.0)
+            delta = map50 - (best_map50 if best_map50 > -1.0 else map50)
+            best_mark = "  ★ NEW BEST" if improved else ""
+            print(f"[val e{epoch + 1:03d}/{cfg.train.epochs:03d}]"
+                  f"  mAP50 {map50:.4f}"
+                  f"  (best {max(best_map50, 0.0):.4f} @ e{_best_epoch:03d})"
+                  f"  Δ {delta:+.4f}"
+                  f"  time {_val_time:.1f}s"
+                  f"{best_mark}")
+
             if improved:
                 best_map50 = map50
+                _best_epoch = epoch + 1
                 epochs_no_improve = 0
                 save_checkpoint(best_path, model, ema, opt, cfg, epoch,
                                 global_step, best_map50, history + [rec])
-                print(f"[ckpt] new best -> {best_path}")
+                print(f"[ckpt] ★ saved best  e{_best_epoch:03d}"
+                      f"  mAP50 {best_map50:.4f}  →  {best_path}")
             else:
                 epochs_no_improve += 1
 
@@ -765,28 +1068,39 @@ def main() -> int:
                 history.append(rec)
                 save_checkpoint(last_path, model, ema, opt, cfg, epoch,
                                 global_step, best_map50, history)
+                save_history(ckpt_dir, history)
                 print(f"[early-stop] no improvement for "
                       f"{epochs_no_improve} evaluations")
                 break
 
+        # ---- epoch summary line (#79/#81) ----
+        _epoch_secs = stats.get("secs", 0.0)
+        _remaining = int(cfg.train.epochs) - (epoch + 1)
+        _eta_run = _dur(_epoch_secs * _remaining) if _remaining > 0 else "—"
+        print(f"════ e{epoch + 1:03d}/{cfg.train.epochs:03d}"
+              f"  train_loss {stats.get('total', 0.0):.4f}"
+              f"  val_mAP50 {rec.get('val_map50', float('nan')):.4f}"
+              f"  best {max(best_map50, 0.0):.4f}"
+              f"  lr {_sci(stats.get('lr', 0.0))}"
+              f"  epoch_time {_dur(_epoch_secs)}"
+              f"  ETA {_eta_run}"
+              f"  patience {epochs_no_improve}/{cfg.train.es_patience}")
+
         history.append(rec)
         save_checkpoint(last_path, model, ema, opt, cfg, epoch, global_step,
                         best_map50, history)
+        # Per-epoch, atomic: a crash / ColdStartError / Ctrl-C must not leave
+        # evaluate.py without its per-level n_pos record.
+        save_history(ckpt_dir, history)
+        write_curves(history, ckpt_dir, _best_epoch if _best_epoch else None)
 
         # End of epoch: advance the EAA freeze schedule.
         model.step_eaa_epoch()
 
-    with open(os.path.join(ckpt_dir, "history.json"), "w",
-              encoding="utf-8") as fh:
-        json.dump(history, fh, indent=2)
-
-    print("=" * 70)
-    print(f"  done. best {cfg.eval.select_split} mAP50 "
-          f"{max(best_map50, 0.0):.4f}")
-    print(f"  headline number must come from the '{cfg.eval.report_split}' "
-          f"split: python evaluate.py --checkpoint {best_path}"
-          + (f" --profile {profile_path}" if profile_path else ""))
-    print("=" * 70)
+    print_session_footer(max(best_map50, 0.0), _best_epoch, best_path)
+    if isinstance(sys.stdout, _Tee):
+        sys.stdout = sys.stdout._term
+        sys.stdout.flush()
     return 0
 
 

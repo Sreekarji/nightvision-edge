@@ -17,6 +17,13 @@ from model import build_nirdet
 _failures: list = []
 
 
+def _synthetic_cfg():
+    """Priors are UNSET by default and that is fatal (model.build_nirdet).
+    These are SYNTHETIC demo values — the same 0.05/0.15 convention as
+    model.py's __main__ — deliberately not any dataset measurement."""
+    return get_config(model=dict(prior_w=0.05, prior_h=0.15))
+
+
 def check(cond: bool, msg: str) -> None:
     if cond:
         print(f"  PASS  {msg}")
@@ -27,7 +34,7 @@ def check(cond: bool, msg: str) -> None:
 
 def t1_no_grouped_convs() -> None:
     print("\nT1  zero grouped / depthwise convolutions")
-    net = build_nirdet()
+    net = build_nirdet(_synthetic_cfg())
     n = net.count_grouped_convs()
     # Not a support question: ST lists DEPTHWISE_CONV_2D as HW-mapped. It is
     # an occupancy question. A 3x3 with groups=channels gives the four CONV
@@ -42,7 +49,7 @@ def t1_no_grouped_convs() -> None:
 
 def t2_three_blobs() -> None:
     print("\nT2  forward_raw gives 3 levels x 3 blobs")
-    cfg = get_config()
+    cfg = _synthetic_cfg()
     net = build_nirdet(cfg).eval()
     x = torch.zeros(1, 1, cfg.data.img_h, cfg.data.img_w)
     with torch.no_grad():
@@ -68,7 +75,7 @@ def t2_three_blobs() -> None:
 
 def t3_packed_shapes() -> None:
     print("\nT3  packed training shapes at 288x512")
-    cfg = get_config()
+    cfg = _synthetic_cfg()
     check((cfg.data.img_h, cfg.data.img_w) == (288, 512),
           f"canvas is {cfg.data.img_h}x{cfg.data.img_w}")
     net = build_nirdet(cfg)
@@ -85,7 +92,7 @@ def t3_packed_shapes() -> None:
 
 def t4_eaa_calibration() -> None:
     print("\nT4  EAA calibration")
-    cfg = get_config()
+    cfg = _synthetic_cfg()
     net = build_nirdet(cfg)
     check(not net.eaa.is_calibrated,
           "a fresh model is NOT calibrated (eaa_proj_bias is None)")
@@ -115,6 +122,9 @@ def t4_eaa_calibration() -> None:
           f"{float(gate.max()):.3f}  spread {spread:.3f}")
     check(spread > 0.02, "the calibrated gate varies spatially (not a "
                          "near-uniform rescale)")
+    check(float(net.eaa._gate_span) >= 0.25,
+          f"_gate_span {float(net.eaa._gate_span):.4f} >= 0.25 "
+          f"(calibration achieved a real spatial modulation)")
 
     second = net.calibrate_eaa(img, verbose=False)
     check(second is None, "a second calibrate_eaa call is a no-op "
@@ -123,7 +133,7 @@ def t4_eaa_calibration() -> None:
 
 def t5_p5_ablation() -> None:
     print("\nT5  P5 ablation: strides=(8, 16)")
-    cfg = get_config(model=dict(strides=(8, 16)))
+    cfg = get_config(model=dict(strides=(8, 16), prior_w=0.05, prior_h=0.15))
     net = build_nirdet(cfg)
     net.train()
     x = torch.zeros(1, 1, cfg.data.img_h, cfg.data.img_w)
@@ -142,11 +152,11 @@ def t5_p5_ablation() -> None:
 
 def t6_inference_path() -> None:
     print("\nT6  inference decode returns boxes + scores only")
-    cfg = get_config()
+    cfg = _synthetic_cfg()
     net = build_nirdet(cfg).eval()
     x = torch.rand(2, 1, cfg.data.img_h, cfg.data.img_w)
     with torch.no_grad():
-        res = net(x, training_mode=False)
+        res = net(x, training_mode=False, score_thresh=0.05)
     check(len(res) == 2, "one result per batch item")
     check(len(res[0]) == 2,
           "each result is [boxes, scores] — single class, so no labels")
@@ -157,7 +167,7 @@ def t6_inference_path() -> None:
 
 def t7_param_breakdown() -> None:
     print("\nT7  param_breakdown")
-    net = build_nirdet()
+    net = build_nirdet(_synthetic_cfg())
     pb = net.param_breakdown()
     for k in ("backbone", "eaa", "neck", "head", "total"):
         check(k in pb, f"breakdown has '{k}' = {pb.get(k, 0):,}")

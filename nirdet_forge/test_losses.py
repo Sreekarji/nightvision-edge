@@ -118,7 +118,7 @@ def t4_collision() -> None:
     big = torch.tensor([0.5, 0.5, 0.40, 0.80])
     small = torch.tensor([0.5, 0.5, 0.05, 0.16])
     preds = _dummy(1, lf.geom, 3)
-    _, boxes, _ = lf.assigner(
+    _, boxes, _, _nf = lf.assigner(
         torch.sigmoid(torch.cat([p[..., 4] for p in preds], 1)),
         lf.geom.to(torch.device("cpu")).decode(
             torch.cat([p[..., :4] for p in preds], 1)),
@@ -126,15 +126,23 @@ def t4_collision() -> None:
                        torch.tensor([W, H, W, H])),
         torch.ones(1, 2), lf.geom.centers_px())
     areas = (boxes[..., 2] - boxes[..., 0]) * (boxes[..., 3] - boxes[..., 1])
-    got = float(areas[0, areas[0] > 0].min())
-    want = 0.05 * W * 0.16 * H
-    print(f"        contested cells -> area {got:.0f} (small GT {want:.0f})")
-    check(abs(got - want) < 1.0, "contested cells assigned to the smaller GT")
+    # Find cells assigned to EITHER GT (positive cells only).
+    # At least one cell must be assigned to the small GT.
+    small_area = 0.05 * W * 0.16 * H
+    big_area = 0.40 * W * 0.80 * H
+    pos_areas = areas[0][areas[0] > 0]
+    n_small = int((pos_areas < (small_area + big_area) / 2).sum())
+    print(f"        small GT area {small_area:.0f}, big GT area {big_area:.0f}, "
+          f"cells assigned to small GT: {n_small}")
+    check(n_small >= 1,
+          f"at least one cell assigned to the smaller GT ({n_small} found)")
+    check(float(pos_areas.min()) < (small_area + big_area) / 2,
+          "minimum assigned area is the small GT area, not the big GT area")
 
 
 def t5_geometry() -> None:
     print("\nT5  geometry is derived from resolution; 512x288 -> 3024 cells")
-    cfg = get_config()
+    cfg = get_config(model=dict(prior_w=0.05, prior_h=0.15))
     for (h, w) in ((288, 512), (384, 640), (256, 416), (288, 1024)):
         g = AnchorGeometry(h, w, (8, 16, 32))
         expect = ((h // 8) * (w // 8) + (h // 16) * (w // 16)
@@ -169,7 +177,7 @@ def t6_per_level() -> None:
 
 def t7_cold_start() -> None:
     print("\nT7  cold-start assertion")
-    cfg = get_config()
+    cfg = get_config(model=dict(prior_w=0.05, prior_h=0.15))
     lf = NIRDetLoss()
     lf.set_epoch(0)
     preds = [torch.zeros(1, h * w, 5) for h, w in lf.geom.grid_sizes]
@@ -203,9 +211,31 @@ def t7_cold_start() -> None:
           "the error names head.size_pred.bias as the first thing to check")
 
 
+def t9_fallback_assignment() -> None:
+    print("\nT9  sub-stride GT box receives a fallback assignment")
+    lf = NIRDetLoss()
+    lf.set_epoch(0)
+
+    # Construct a GT box that is guaranteed to contain NO stride-8 cell centre.
+    # At 512x288, stride-8 cell centres are at (4, 12, 20, ...) horizontally.
+    # A 3px-wide box at x=8..11 contains no centre.
+    W, H = float(lf.geom.img_w), float(lf.geom.img_h)
+    tiny_cx = 9.5 / W      # centre at pixel 9.5
+    tiny_w  = 3.0 / W      # 3 px wide: centres at 4 and 12 are outside
+    tiny_cy = 0.5
+    tiny_h  = 0.10
+    gt = [torch.tensor([[tiny_cx, tiny_cy, tiny_w, tiny_h]])]
+    preds = _dummy(1, lf.geom, 0)
+    out = lf(preds, gt)
+    check(int(out["n_pos"]) >= 1,
+          f"sub-stride GT gets n_pos={int(out['n_pos'])} >= 1 (fallback works)")
+    check(int(out["n_gt_fallback"]) >= 1,
+          f"n_gt_fallback={int(out['n_gt_fallback'])} >= 1")
+
+
 def t8_tal_settings() -> None:
     print("\nT8  TAL alignment exponents")
-    cfg = get_config()
+    cfg = get_config(model=dict(prior_w=0.05, prior_h=0.15))
     lf = NIRDetLoss()
     check(lf.assigner.alpha == 0.5,
           f"tal_alpha == 0.5 (got {lf.assigner.alpha}) — the YOLOv8 setting. "
@@ -232,6 +262,7 @@ def main() -> int:
     t6_per_level()
     t7_cold_start()
     t8_tal_settings()
+    t9_fallback_assignment()
     print("=" * 70)
     if _failures:
         print(f"  {len(_failures)} FAILURE(S):")

@@ -2,55 +2,43 @@
 attention.py — Edge-Aware Attention (EAA), export-safe and numerically active
 =============================================================================
 
+RANGE LEDGER
+------------
+* DenseResBlock output (backbone F5/F6): [0, 12] per stage; [0, 18] after a
+  two-block stage. Clamped to [0, 6] by backbone.DenseResBlock.forward.
+* EAA apply_to output: feat*(0.5+attn) clamped to [0,6] (this file,
+  apply_to). Range-preserving: gate is monotone across the full [0,6]
+  input range. At attn=0.5 (calibrated mean) it is the identity.
+* FPN fusions (neck F78): td4 = l4+up5, td3 = l3+up4 are unactivated.
+  Clamped by neck.LightweightFPN when fuse_clip=True (neck.py).
+All three clamps are ONNX Clip nodes, unconditionally HW-mapped on
+Neural-ART and on the Pi's NCNN fast path.
+
 WHY THE OLD MODULE WAS INERT
 ----------------------------
 ``compute_edge_magnitude`` ran the Sobel convolution at full resolution and
 then average-pooled by 8, i.e. it averaged |edge| over a 64-pixel area. A
 pedestrian silhouette is a SPARSE edge inside that window, so the pooled value
-is diluted by edge density and typically lands in 0.01-0.05 on [0,1] NIR. With
-unit-sum ``proj`` weights and bias -0.1 that gives
-
-    a_raw = sum(w * e) - 0.1  ~=  0.03 - 0.1  =  -0.07    everywhere
-    sigmoid(a_raw)            ~=  0.48                     everywhere
-    gain = 1 + 2.0 * 0.48     ~=  1.96                     everywhere
-
-which is a near-uniform rescale. The BatchNorm immediately downstream exists
-to absorb exactly that kind of rescaling, so the module contributed nothing.
+is diluted and typically lands in 0.01-0.05. With unit-sum ``proj`` weights and
+bias -0.1 the gate collapsed to sigmoid(-0.07) ~= 0.48 everywhere — a
+near-uniform rescale that the downstream BatchNorm absorbs entirely.
 
 TWO FIXES
 ---------
-1. STRIDE-2 EDGE CONV, POOL BY 4 (was: full-res conv, pool by 8).
-   The convolution now runs on the stride-2 map and is reduced by 4 to reach
-   stride 8. Three consequences:
-     * peak activation for this branch drops 4x, which matters because the
-       STM32N6 degrades sharply past ~4 MB when it spills to external memory;
-     * the constant-padded canvas border no longer smears a full-resolution
-       zero edge into the first pooled row/column;
-     * every pooling kernel stays at 2 (ST: AveragePool kernels must be 1-3,
-       larger windows are decomposed by the compiler), and at 512 canvas width
-       the pooled map is 256 wide x 4 ch = 1024, inside ST's 2048
-       width x channel pooling line-buffer limit.
-
-2. ``calibrate_bias(images)``.
-   The projection bias is MEASURED from the real pooled edge statistics and
-   set to -(mean + 0.5*std), so the sigmoid straddles a useful part of its
-   range instead of collapsing to 0.48. It cannot be hardcoded: it depends on
-   the sensor, the 850 nm illuminator beam profile, the flat-field map and the
-   CLAHE settings. train.py calls this on the first real batch, BEFORE the
-   edge kernels unfreeze, and writes the result back to
-   cfg.model.eaa_proj_bias so it lands in the checkpoint.
+1. STRIDE-2 EDGE CONV, POOL BY 4 (was: full-res conv, pool by 8). Peak
+   activation for this branch drops 4x, the constant-padded canvas border no
+   longer smears into the first pooled row/column, and every pooling kernel
+   stays at 2 (ST: AveragePool kernels must be 1-3).
+2. ``calibrate_bias(images)``. The projection bias is MEASURED from the real
+   pooled edge statistics and set to -(mean + 0.5*std). It cannot be
+   hardcoded: it depends on the sensor, the 850 nm illuminator beam profile,
+   the flat-field map and the CLAHE settings.
 
 OTHER EXPORT NOTES
 ------------------
-* ``normalize_edges`` defaults False. Per ST's operator table, Div maps to
-  hardware only when the second operand is a constant; a per-image
-  ``e / e.mean()`` divisor is a runtime tensor, so it becomes SW_INT on the
-  Cortex-M55 and it makes the INT8 activation range scene-dependent.
-  Brightness stabilisation belongs in preprocessing (flat-field + CLAHE).
-* Padding mode is ``zeros``: ST maps Pad "partial - according to the
-  parameters", and reflect is the case that falls back.
-* ``residual_scale`` 2.0 -> gain in [1.0, 3.0]. At 0.5 the gain was confined
-  to [1.0, 1.5] immediately before a BatchNorm.
+* ``normalize_edges`` defaults False: a per-image ``e / e.mean()`` divisor is
+  a runtime tensor, so ST maps it SW_INT.
+* Padding mode is ``zeros``; reflect Pad falls back to software.
 * ``_current_epoch`` is restored from ``_epoch_buf`` in
   ``_load_from_state_dict``, so resuming at epoch 40 does not re-freeze the
   Sobel kernels for another 5 epochs.
@@ -65,25 +53,44 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# 3x3 kernels normalised into [-1, 1]; shape (1, 1, 3, 3) each.
-_SOBEL_X = torch.tensor([[[[1., 0., -1.], [2., 0., -2.], [1., 0., -1.]]]]) / 4.0
-_SOBEL_Y = torch.tensor([[[[1., 2., 1.], [0., 0., 0.], [-1., -2., -1.]]]]) / 4.0
-_LAPLACIAN = torch.tensor([[[[1., 1., 1.], [1., -8., 1.], [1., 1., 1.]]]]) / 8.0
-_DIAG_POS = torch.tensor([[[[0., 1., 2.], [-1., 0., 1.], [-2., -1., 0.]]]]) / 4.0
-_DIAG_NEG = torch.tensor([[[[-2., -1., 0.], [-1., 0., 1.], [0., 1., 2.]]]]) / 4.0
+# 3x3 seed kernels, unit-L2, shape (1, 3, 3) each.
+def _edge_templates_canonical() -> list:
+    """
+    Canonical edge templates shared by NIRStem (backbone.py) and EAA
+    (attention.py). Each is a (1,3,3) float32 tensor, rescaled to unit-L2
+    so callers can normalise at their own call site.
 
-_TEMPLATES: List[torch.Tensor] = [
-    _SOBEL_X, _SOBEL_Y, _LAPLACIAN, _DIAG_POS, _DIAG_NEG,
-]
+    Sign convention: positive response on a bright-left / dark-right edge
+    (Sobel-x). NIRStem takes abs() via BN; EAA takes abs() explicitly.
+    Both are followed by BN, so the sign is absorbed.
+    """
+    Gx  = torch.tensor([[[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]]]) / 4.0
+    Gy  = torch.tensor([[[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]]]) / 4.0
+    G45 = torch.tensor([[[0., 1., 2.], [-1., 0., 1.], [-2., -1., 0.]]]) / 4.0
+    G135= torch.tensor([[[-2., -1., 0.], [-1., 0., 1.], [0., 1., 2.]]]) / 4.0
+    Lap = torch.tensor([[[0., -1., 0.], [-1., 4., -1.], [0., -1., 0.]]]) / 4.0
+    LapD= torch.tensor([[[-1., -1., -1.], [-1., 8., -1.], [-1., -1., -1.]]]) / 8.0
+    out = []
+    for t in (Gx, Gy, G45, G135, Lap, LapD):
+        n = t.norm()
+        out.append(t / n if float(n) > 1e-12 else t)
+    return out
+
+
+# Seed templates, in priority order. At default N=4 ALL four slots are seeded
+# (there are exactly 4 templates used); none stay Kaiming-uniform at N=4.
+# Each template is rescaled to the std of the Kaiming-initialised slots it
+# replaces so the seeded and random filters enter the pipeline at equal
+# magnitude. At N=6 the last two slots stay Kaiming-uniform.
+_TEMPLATES: List[torch.Tensor] = [t.unsqueeze(0) for t in _edge_templates_canonical()]
 
 
 def _pool_by_factor(x: torch.Tensor, factor: int) -> torch.Tensor:
     """
     Average-pool by an integer factor using only kernels of size 2 or 3.
 
-    ST Neural-ART decomposes AveragePool windows with height or width above 3,
-    and NCNN's pooling fast paths are tuned for 2x2/3x3. Factorising 4 -> 2*2
-    keeps every kernel inside the hardware-friendly range.
+    ST Neural-ART decomposes AveragePool windows above 3, and NCNN's pooling
+    fast paths are tuned for 2x2/3x3.
     """
     if factor <= 1:
         return x
@@ -112,8 +119,7 @@ class EdgeAwareAttention(nn.Module):
         p4 = eaa.apply_to(p4, e8)                # ratio 2 -> avg_pool2d(2)
         p5 = eaa.apply_to(p5, e8)                # ratio 4 -> avg_pool2d(2) x2
 
-    The total edge stride is ``edge_stride * pool_factor`` and must equal the
-    finest detection stride (8).
+    ``edge_stride * pool_factor`` must equal the finest detection stride (8).
     """
 
     def __init__(
@@ -156,9 +162,8 @@ class EdgeAwareAttention(nn.Module):
 
         self._init_weights(proj_bias)
         self.register_buffer("_epoch_buf", torch.zeros(1, dtype=torch.long))
-        # 0 = bias is the uncalibrated default, 1 = calibrate_bias() has run.
-        # Buffered so a resumed run does not silently recalibrate.
         self.register_buffer("_calibrated", torch.zeros(1, dtype=torch.long))
+        self.register_buffer("_gate_span", torch.zeros(1))
         if proj_bias is not None:
             self._calibrated.fill_(1)
         self._update_grad_state()
@@ -177,6 +182,11 @@ class EdgeAwareAttention(nn.Module):
 
     @property
     def proj_bias_value(self) -> float:
+        """
+        The projection bias only. After calibrate_bias() this reflects ONLY
+        the bias, not the gain: calibration also scales proj.weight by k, so
+        the full gate span lives in the ``_gate_span`` buffer.
+        """
         return float(self.proj.bias.detach().reshape(-1)[0].item())
 
     # ------------------------------------------------------------------ #
@@ -186,15 +196,19 @@ class EdgeAwareAttention(nn.Module):
     def _init_weights(self, proj_bias: Optional[float]) -> None:
         with torch.no_grad():
             nn.init.kaiming_uniform_(self.edge_conv.weight, a=0.01)
+            ref_std = float(self.edge_conv.weight.std())
             for i in range(min(self.N, len(_TEMPLATES))):
-                self.edge_conv.weight[i] = _TEMPLATES[i][0]
+                t = _TEMPLATES[i][0]
+                t_std = float(t.std())
+                scale = (ref_std / t_std) if t_std > 1e-12 else 1.0
+                self.edge_conv.weight[i] = t * scale
 
-            # Unit-sum positive projection: proj then computes the mean edge
-            # response across filters, which is exactly the statistic
-            # calibrate_bias() measures. The bias is a PLACEHOLDER until
-            # calibration; -0.1 is not a meaningful value for the stride-2 /
-            # pool-4 edge distribution and is only here so an uncalibrated
-            # forward pass does not produce a degenerate gate.
+            # Initial unit-sum projection: proj starts as a cross-filter mean.
+            # calibrate_bias() later scales proj.weight by k = logits_per_sigma/std,
+            # breaking the unit-sum property ON PURPOSE to make the gate spatially
+            # active. After calibration, train.py's weight-decay exemption for
+            # eaa.proj.weight is LOAD-BEARING: decay would pull k back toward 1/N
+            # and re-inert the gate.
             self.proj.weight.fill_(1.0 / float(self.N))
             self.proj.bias.fill_(-0.1 if proj_bias is None else float(proj_bias))
 
@@ -205,59 +219,101 @@ class EdgeAwareAttention(nn.Module):
     @torch.no_grad()
     def calibrate_bias(self, img: torch.Tensor,
                        std_mult: float = 0.5,
+                       logits_per_sigma: float = 2.0,
+                       min_gate_span: float = 0.25,
                        verbose: bool = True) -> float:
         """
-        Measure the real pooled edge statistics and set proj.bias so the
-        sigmoid spans a useful range.
+        Calibrate BOTH the gain (proj.weight scale) and the bias so the gate
+        spans a useful range over the real edge-response distribution.
 
-            a_raw(x) = (W * e)(x) + b          with sum(W) = 1
-            b        = -(mean(W*e) + std_mult * std(W*e))
+            k = logits_per_sigma / std(s)     # scale so ±1σ = ±logits_per_sigma
+            proj.weight *= k                  # unit-sum property broken ON PURPOSE
+            proj.bias   = -k*(mean(s) + std_mult*std(s))
 
-        With std_mult = 0.5 the flat majority of the frame sits BELOW
-        sigmoid 0.5 (attenuated) and pixels more than half a standard
-        deviation above the mean edge response sit above it (amplified). That
-        is a gate; a constant 0.48 is not.
+        After calibration the gate spans ≈ sigmoid(-logits_per_sigma – std_mult)
+        to sigmoid(+logits_per_sigma*(2 – std_mult)), which is a real modulation
+        the downstream BatchNorm cannot absorb.
 
-        Call on a real batch (after flat-field + CLAHE + letterbox, i.e. the
-        exact deployment preprocessing), before the edge kernels unfreeze.
-
-        img : (B, 1, H, W) in [0, 1]
-        ->    the bias value that was set
+        train.py's weight-decay exemption for eaa.proj.weight is LOAD-BEARING
+        after this call: decay would pull k back toward 1/N and re-inert the gate.
         """
         if img.dim() != 4 or img.shape[1] != 1:
             raise ValueError(f"expected (B, 1, H, W), got {tuple(img.shape)}")
         if img.shape[0] < 1:
             raise ValueError("need at least one image to calibrate")
+        if self.normalize_edges:
+            raise RuntimeError(
+                "calibrate_bias measures the UNNORMALISED pooled edge statistic; "
+                "with normalize_edges=True the runtime divides by a per-image mean "
+                "(≈ ×33), so the calibrated bias would be off by ~1/mean and the "
+                "gate would saturate to 1.0 everywhere. "
+                "Set normalize_edges=False (it is SW_INT on Neural-ART anyway).")
 
         was_training = self.training
         self.eval()
         try:
             e = self._edge_maps(img.to(self.proj.weight.device,
                                        dtype=self.proj.weight.dtype))
-            # Pre-bias projection response. Done with the real weights so a
-            # later change to the proj init cannot desynchronise the two.
-            s = F.conv2d(e, self.proj.weight, bias=None)       # (B, 1, H/8, W/8)
+            s = F.conv2d(e, self.proj.weight, bias=None)   # measure BEFORE scaling
             mean = float(s.mean().item())
-            std = float(s.std(unbiased=False).item())
-            bias = -(mean + float(std_mult) * std)
+            std  = float(s.std(unbiased=False).item())
+            if std < 1e-6:
+                raise RuntimeError(
+                    "edge response has ~zero variance; check that the calibration "
+                    "batch is real imagery and that flat-field/CLAHE ran")
+            # Scale proj.weight so that ±1σ of the edge response maps to
+            # ±logits_per_sigma logits — making the gate spatially active.
+            k = float(logits_per_sigma) / std
+            self.proj.weight.mul_(k)          # breaks unit-sum ON PURPOSE
+            bias = -k * (mean + float(std_mult) * std)
             self.proj.bias.fill_(bias)
+
+            # Verify the resulting gate span; hard-fail if still degenerate.
+            lo = float(torch.sigmoid(torch.tensor(k * (mean - 2 * std) + bias)))
+            hi = float(torch.sigmoid(torch.tensor(k * (mean + 2 * std) + bias)))
+            span = hi - lo
+            if span < float(min_gate_span):
+                raise RuntimeError(
+                    f"EAA gate spans only {span:.4f} over ±2σ of the measured "
+                    f"edge response (need ≥ {min_gate_span}); the gate is still a "
+                    f"near-uniform rescale that the next BatchNorm will absorb. "
+                    f"Raise logits_per_sigma or set eaa_residual_scale=None.")
+            self._gate_span.fill_(span)
             self._calibrated.fill_(1)
 
             if verbose:
-                gate_flat = torch.sigmoid(torch.tensor(mean + bias))
-                gate_edge = torch.sigmoid(torch.tensor(mean + 2.0 * std + bias))
                 rs = 1.0 if self.residual_scale is None else float(self.residual_scale)
                 print(f"[eaa] calibrated on {img.shape[0]} image(s): "
-                      f"edge response mean {mean:.5f} std {std:.5f} -> "
-                      f"proj.bias {bias:+.5f}")
-                print(f"[eaa]   gain at mean response      : "
-                      f"{1.0 + rs * float(gate_flat):.3f}")
-                print(f"[eaa]   gain at mean + 2 sigma      : "
-                      f"{1.0 + rs * float(gate_edge):.3f}")
-                if std < 1e-6:
-                    print("[eaa]   ! edge response has ~zero variance; check "
-                          "that the calibration batch is real imagery and "
-                          "that flat-field/CLAHE ran")
+                      f"mean {mean:.5f}  std {std:.5f}  k={k:.2f}  "
+                      f"proj.bias {bias:+.5f}  gate_span {span:.4f}")
+                print(f"[eaa]   gain at mean - 2σ : {0.5 + lo:.3f}")
+                print(f"[eaa]   gain at mean + 2σ : {0.5 + hi:.3f}")
+
+            # F11 (audit, diagnostic only — no numerics change): k and bias
+            # are fitted to the UNPOOLED (stride-8) edge statistic, but
+            # apply_to average-pools the edge map by 2 (P4) and 4 (P5) before
+            # proj. Pooling shrinks the std, so the gate span is strictly
+            # smaller at the coarse levels and min_gate_span above only
+            # validates level 0. Measure and warn — a collapsed P5 gate is
+            # otherwise invisible.
+            for r in (2, 4):
+                e_r = _pool_by_factor(e, r)
+                s_r = F.conv2d(e_r, self.proj.weight, bias=self.proj.bias)
+                m_r = float(s_r.mean().item())
+                sd_r = float(s_r.std(unbiased=False).item())
+                lo_r = float(torch.sigmoid(torch.tensor(m_r - 2.0 * sd_r)))
+                hi_r = float(torch.sigmoid(torch.tensor(m_r + 2.0 * sd_r)))
+                span_r = hi_r - lo_r
+                if verbose or span_r < float(min_gate_span):
+                    print(f"[eaa]   pool x{r}: gate span {span_r:.4f} "
+                          f"[{'OK' if span_r >= float(min_gate_span) else 'WEAK'}]"
+                          f"  (logit sigma {sd_r:.3f})")
+                if span_r < float(min_gate_span):
+                    print(f"[eaa]   WARNING the gate at pool factor {r} is a "
+                          f"near-uniform rescale the following BatchNorm will "
+                          f"absorb; EAA contributes little at that level. "
+                          f"Raise logits_per_sigma or document EAA as "
+                          f"effectively stride-8-only.")
             return bias
         finally:
             if was_training:
@@ -302,7 +358,13 @@ class EdgeAwareAttention(nn.Module):
         if key in state_dict:
             try:
                 self._current_epoch = int(state_dict[key].reshape(-1)[0].item())
-            except Exception:
+            except Exception as exc:
+                # NEVER silent (F4): a reset here re-freezes the Sobel kernels
+                # for another freeze_epochs with no diagnostic.
+                print(f"[eaa] WARNING could not restore the epoch counter from "
+                      f"'{key}' ({type(exc).__name__}: {exc}); assuming 0, so "
+                      f"the edge kernels will be frozen for "
+                      f"{self.freeze_epochs} more epochs")
                 self._current_epoch = 0
         else:
             self._current_epoch = int(self._epoch_buf.reshape(-1)[0].item())
@@ -322,11 +384,6 @@ class EdgeAwareAttention(nn.Module):
         """
         img : (B, 1, H, W) in [0, 1]
         ->    (B, N, H/total_edge_stride, W/total_edge_stride), all >= 0
-
-        The convolution runs at stride 2 (edges are a high-frequency cue, but
-        the full-resolution tensor is the peak-RAM contributor and its first
-        row/column is contaminated by the constant letterbox pad), and the
-        result is reduced to stride 8 with two 2x2 average pools.
         """
         e = self._edge_maps(img)
         if self.normalize_edges:
@@ -344,12 +401,26 @@ class EdgeAwareAttention(nn.Module):
         feat  : (B, C, Hf, Wf)
         e_map : (B, N, He, We) from compute_edge_magnitude
         ->      (B, C, Hf, Wf)
+
+        The two resampling cases are split EXPLICITLY (F1). The old combined
+        condition sent a non-integral DOWN ratio (e.g. edge 37x64 -> feature
+        18x32) into the upsample branch, where it failed with "cannot align",
+        naming the wrong problem.
         """
         hf, wf = feat.shape[-2], feat.shape[-1]
         he, we = e_map.shape[-2], e_map.shape[-1]
 
         if (he, we) != (hf, wf):
-            if he >= hf and wf > 0 and he % hf == 0 and we % wf == 0:
+            if hf <= 0 or wf <= 0 or he <= 0 or we <= 0:
+                raise ValueError(
+                    f"degenerate spatial size: edge map {he}x{we}, "
+                    f"feature {hf}x{wf}")
+            if he > hf or we > wf:
+                # Edge map coarser-or-equal in at least one axis -> POOL.
+                if he % hf or we % wf:
+                    raise ValueError(
+                        f"non-integral pool ratio from edge map {he}x{we} to "
+                        f"feature {hf}x{wf}")
                 fh, fw = he // hf, we // wf
                 if fh != fw:
                     raise ValueError(
@@ -357,22 +428,48 @@ class EdgeAwareAttention(nn.Module):
                         f"{he}x{we} and feature {hf}x{wf}")
                 e_map = _pool_by_factor(e_map, fh)
             else:
-                # Feature finer than the edge map. Constant scale_factor keeps
-                # the Resize export-friendly; ST maps Resize Nearest on HW
-                # only with coordinate_transformation_mode='asymmetric' and
-                # nearest_mode='floor', which is what opset-12
-                # mode="nearest" + scale_factor produces.
+                # Feature finer than the edge map -> UPSAMPLE. Constant
+                # scale_factor keeps the Resize export-friendly; ST maps
+                # Resize Nearest on HW only with
+                # coordinate_transformation_mode='asymmetric' and
+                # nearest_mode='floor', which opset-12 mode="nearest" +
+                # scale_factor produces.
                 if hf % he or wf % we:
                     raise ValueError(
-                        f"cannot align edge map {he}x{we} to feature {hf}x{wf}")
+                        f"non-integral upsample ratio from edge map {he}x{we} "
+                        f"to feature {hf}x{wf}")
+                fh, fw = hf // he, wf // we
+                if fh != fw:
+                    raise ValueError(
+                        f"anisotropic upsample ratio {fh}x{fw} between edge "
+                        f"map {he}x{we} and feature {hf}x{wf}")
                 e_map = F.interpolate(
-                    e_map, scale_factor=float(hf // he),
+                    e_map, scale_factor=float(fh),
                     mode="nearest", recompute_scale_factor=False,
                 )
 
         attn = torch.sigmoid(self.proj(e_map))          # (B, 1, Hf, Wf)
         if self.residual_scale is not None:
-            return feat * (1.0 + float(self.residual_scale) * attn)
+            # RANGE-PRESERVING GATE (replaces feat*(1+2*attn) clamped to 6).
+            #
+            # The old form: feat*(1+2*attn) clamped to 6. For feat in [0,6]
+            # and attn in (0,1) the multiplier is in (1,3), so any feat >= 2
+            # is partially clipped and any feat >= 6 is fully clipped — the
+            # gate contributes NOTHING at the strongest activations.
+            #
+            # New form: feat * (0.5 + attn).
+            #   attn=0  -> feat * 0.5  (suppress)
+            #   attn=0.5 -> feat * 1.0  (identity, the calibrated mean)
+            #   attn=1  -> feat * 1.5  (amplify)
+            # Output range is [0, 9] before the clamp, so feat=6 contributes
+            # gate * 6 with gate in (0.5, 1.5) — monotone across the full
+            # input range. ONNX Clip node, HW-mapped on Neural-ART and NCNN.
+            #
+            # TRAINED-NUMERICS DECISION: must be set before the first training
+            # run. The weight-decay exemption for eaa.proj.weight in train.py
+            # is still load-bearing.
+            out = feat * (0.5 + attn)
+            return torch.clamp(out, 0.0, 6.0)   # ONNX Clip, HW-mapped
         return feat * attn
 
     def forward(self, feat: torch.Tensor, img: torch.Tensor) -> torch.Tensor:
@@ -404,8 +501,6 @@ def build_eaa(
 
 if __name__ == "__main__":
     eaa = build_eaa()
-    # Synthetic frame with sparse structure, so the calibration numbers are
-    # not those of uniform noise.
     img = torch.zeros(4, 1, 288, 512)
     img += 0.15
     img[:, :, 100:200, 120:140] = 0.75          # a few bright vertical bars
@@ -414,6 +509,8 @@ if __name__ == "__main__":
     img.clamp_(0.0, 1.0)
 
     print("total edge stride:", eaa.total_edge_stride)
+    print("seeded templates :", min(eaa.N, len(_TEMPLATES)), "of",
+          len(_TEMPLATES), "(the rest stay Kaiming-uniform)")
     print("calibrated before:", eaa.is_calibrated)
     eaa.calibrate_bias(img)
     print("calibrated after :", eaa.is_calibrated,

@@ -1,46 +1,44 @@
 """
 dataset_profiles.py — measure a dataset once, derive everything from it
 ========================================================================
-Nothing in this codebase should contain a number tuned around 261 images.
-This module is the mechanism: it scans a YOLO-format root, computes the box
-statistics in CANVAS space, and writes a YAML that config.py consumes through
-DatasetProfile.apply(cfg).
+Nothing in this codebase should contain a number tuned around one particular
+dataset. This module is the mechanism: it scans a YOLO-format root, computes
+box statistics in CANVAS space, and writes a YAML that config.py consumes
+through DatasetProfile.apply(cfg).
 
 WHAT IS DERIVED
 ---------------
+    cfg.data.root                          the dataset root itself
     cfg.data.n_train / n_val / n_test      split sizes
     cfg.data.n_train_boxes                 -> copy_paste_p_for()
     cfg.model.prior_w / prior_h            -> head size_pred bias init
     cfg.eval.deploy_score_thresh           -> live_nirdet.py --profile
+    cfg.eval.baseline_map50 / source       -> evaluate.py (when measured)
+    cfg.aug.flat_field_path / clahe_*      -> THE PREPROCESSING CONTRACT
 
-CANVAS-SPACE PRIORS
--------------------
-prior_w and prior_h are the MEDIANS of the canvas-normalised box width and
-height on the training split. At 512x288 from 1280x720 sources the letterbox
-scale is min(512/1280, 288/720) = 0.4 in both axes, so pad_x = pad_y = 0 and
-the canvas-normalised values are numerically identical to the raw YOLO label
-values. That is a property of this particular canvas/source pair, not an
-assumption: this module reads each image's real dimensions and applies the
-real letterbox transform, so a mixed-resolution or non-16:9 source set still
-profiles correctly.
+THE PREPROCESSING CONTRACT TRAVELS WITH THE PROFILE
+---------------------------------------------------
+flat_field_path, clahe_enabled, clahe_clip and clahe_grid are the other half
+of the train/deploy contract (config.deploy_contract hashes them). Without
+them in the profile there is no mechanism that transports the preprocessing
+from the training machine to the Pi: live_nirdet.py --flat-field defaults to
+cfg.aug.flat_field_path, which is None in a fresh config regardless of what
+training used.
 
-The priors are load-bearing. head._init_predictions writes log(prior_w) and
-log(prior_h) into size_pred[lvl].bias, and that init is the only reason
-Task-Aligned Assignment finds any positive at epoch 0. A prior measured at
-the wrong canvas produces a run whose classification loss falls steadily and
-whose regression branch never receives a gradient.
+VERIFICATION IS OPT-OUT
+-----------------------
+apply(verify=False) skips the on-disk freshness check. The Pi does not host
+the dataset, and it needs only the derived scalars; an unconditional
+verify_fresh() made the documented deployment command impossible to run. The
+CANVAS fingerprint check is NEVER skipped — it costs no I/O and it is the one
+that silently biases the head's size-prior init.
 
 TWO FINGERPRINTS, TWO SEVERITIES
 --------------------------------
-canvas_fingerprint  SHA-256 of "HxW:s1,s2,s3". A mismatch is a HARD ERROR:
-                    every derived value in the file — priors, percentiles,
-                    size buckets, deploy threshold — is expressed in canvas
-                    units, so a canvas change invalidates all of them at once
-                    and silently biases the head init.
-label_sha256        SHA-256 over all label file contents. A mismatch is a
-                    WARNING: labels get corrected without the geometry
-                    changing, and forcing a reprobe for that would just teach
-                    people to delete the check.
+image geometry      HARD ERROR: dimensions set the letterbox scale, so a
+                    resize invalidates prior_w / prior_h and the deploy
+                    threshold.
+label_sha256        WARNING: labels get corrected without geometry moving.
 """
 
 from __future__ import annotations
@@ -51,6 +49,7 @@ import os
 from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import cv2
 import numpy as np
 
 try:
@@ -58,15 +57,26 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise SystemExit("dataset_profiles.py needs PyYAML: pip install pyyaml") from exc
 
-from config import STRIDES, Config, get_config
-from dataset import (label_path_for, list_images, read_yolo_labels,
-                     resolve_split_dirs)
+from config import (DEFAULT_DEPLOY_SCORE_THRESH, STRIDES, Config, get_config)
+from dataset import label_path_for, read_yolo_labels
+# F57: path/split discovery now lives in the torch-free preprocess module.
+from preprocess import list_images, resolve_split_dirs
 
 PERCENTILES: Tuple[int, ...] = (5, 25, 50, 75, 95)
 
 # COCO area thresholds, applied to CANVAS pixels.
 SMALL_MAX_AREA = 32.0 ** 2
 MEDIUM_MAX_AREA = 96.0 ** 2
+
+# Boxes below this CANVAS extent are dropped by NIRPedDataset.__getitem__, so
+# they must not contribute to the priors or to the box count that drives
+# copy_paste_p either (F26).
+MIN_CANVAS_BOX_PX: float = 2.0
+
+
+def _fmt_thresh(v) -> str:
+    """Format an Optional deploy threshold for prints (F13: None is legal)."""
+    return "unset (run evaluate.py)" if v is None else f"{float(v):.3f}"
 
 
 # ===========================================================================
@@ -81,13 +91,18 @@ def canvas_fingerprint(img_h: int, img_w: int,
 
 
 def geometry_fingerprint(root: str, splits) -> str:
-    """SHA-256 over (relative image path, width, height) for every image.
+    """
+    SHA-256 over (relative image path, width, height) for every image.
 
     Image BYTES are not hashed — re-encoding must stay free — but DIMENSIONS
-    cannot be ignored: they set the letterbox scale, so resizing a source image
-    silently moves prior_w / prior_h while leaving label_sha256 untouched.
+    cannot be ignored: they set the letterbox scale, so resizing a source
+    image silently moves prior_w / prior_h while leaving label_sha256 alone.
+
+    An unreadable image is a HARD ERROR (F25). Encoding the failure as
+    b"<unreadable>" meant a file that was temporarily locked at profile time
+    and readable later produced a StaleProfileError claiming the geometry had
+    changed — wrong and unactionable.
     """
-    import hashlib
     h = hashlib.sha256()
     for split in sorted(splits):
         try:
@@ -95,10 +110,13 @@ def geometry_fingerprint(root: str, splits) -> str:
         except FileNotFoundError:
             continue
         for p in sorted(list_images(img_dir)):
-            img = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
-            if img is None:
-                continue
-            ih, iw = img.shape[:2]
+            try:
+                ih, iw = _image_size(p)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"cannot read image dimensions for {p}: {exc}. Fix or "
+                    f"remove the file — its dimensions set the letterbox "
+                    f"scale and therefore prior_w/prior_h.") from exc
             rel = os.path.relpath(p, root).replace("\\", "/").encode("utf-8")
             h.update(len(rel).to_bytes(4, "big"))
             h.update(rel)
@@ -107,17 +125,25 @@ def geometry_fingerprint(root: str, splits) -> str:
     return h.hexdigest()
 
 
-def label_fingerprint(label_files: Sequence[str]) -> str:
+def label_fingerprint(label_files: Sequence[str], root: str = "") -> str:
+    """
+    Content-sensitive fingerprint of a set of label files.
+
+    Paths are hashed ROOT-RELATIVE so that moving a file between splits
+    (train ↔ test) changes the fingerprint even when the file contents are
+    unchanged — a move invalidates prior_w/prior_h and deploy_score_thresh.
+    """
     h = hashlib.sha256()
     for p in sorted(label_files):
-        h.update(os.path.basename(p).encode("utf-8"))
-        h.update(b"\0")
+        rel = os.path.relpath(p, root).replace("\\", "/") if root else os.path.basename(p)
+        rel_b = rel.encode("utf-8")
+        h.update(len(rel_b).to_bytes(4, "big"))
+        h.update(rel_b)
         try:
             with open(p, "rb") as fh:
                 h.update(fh.read())
         except OSError:
-            h.update(b"<missing>")
-        h.update(b"\n")
+            pass
     return h.hexdigest()
 
 
@@ -125,19 +151,22 @@ def label_fingerprint(label_files: Sequence[str]) -> str:
 # image size probing
 # ===========================================================================
 
+try:
+    from PIL import Image as _PIL_Image
+except ImportError:
+    raise SystemExit(
+        "dataset_profiles.py requires Pillow: pip install Pillow")
+
+_SIZE_CACHE: dict = {}
+
 def _image_size(path: str) -> Tuple[int, int]:
-    """(h, w) without a full decode where possible."""
-    try:
-        from PIL import Image  # noqa: WPS433
-        with Image.open(path) as im:
-            w, h = im.size
-        return int(h), int(w)
-    except Exception:
-        import cv2
-        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            raise RuntimeError(f"could not read image {path}")
-        return int(img.shape[0]), int(img.shape[1])
+    hit = _SIZE_CACHE.get(path)
+    if hit is not None:
+        return hit
+    with _PIL_Image.open(path) as im:
+        result = (im.height, im.width)
+    _SIZE_CACHE[path] = result
+    return result
 
 
 def _letterbox_params(raw_h: int, raw_w: int, out_h: int, out_w: int
@@ -156,6 +185,7 @@ def _letterbox_params(raw_h: int, raw_w: int, out_h: int, out_w: int
 class SplitStats:
     n_images: int = 0
     n_boxes: int = 0
+    n_boxes_dropped_subpixel: int = 0
     boxes_per_image_mean: float = 0.0
     boxes_per_image_std: float = 0.0
     boxes_per_image_max: int = 0
@@ -184,8 +214,11 @@ def profile_split(root: str, split: str, img_h: int, img_w: int
     """
     Scan one split. Returns (stats, label_file_paths).
 
-    All width/height/aspect statistics are canvas-normalised; the size
-    buckets are canvas pixels.
+    All width/height/aspect statistics are canvas-normalised; the size buckets
+    are canvas pixels. Boxes smaller than MIN_CANVAS_BOX_PX in either axis are
+    EXCLUDED, because NIRPedDataset.__getitem__ drops them too — counting them
+    biases prior_w/prior_h downward and inflates the count that drives
+    copy_paste_p (F26).
     """
     img_dir, lbl_dir = resolve_split_dirs(root, split)
     images = list_images(img_dir)
@@ -199,22 +232,30 @@ def profile_split(root: str, split: str, img_h: int, img_w: int
     ars: List[float] = []
     areas_px: List[float] = []
     zero_pad = 0
+    dropped = 0
 
     for p in images:
         lp = label_path_for(p, lbl_dir)
         label_files.append(lp)
         boxes = read_yolo_labels(lp)
-        per_img_counts.append(int(boxes.shape[0]))
 
         raw_h, raw_w = _image_size(p)
         scale, pad_x, pad_y = _letterbox_params(raw_h, raw_w, img_h, img_w)
         if pad_x == 0 and pad_y == 0:
             zero_pad += 1
         if boxes.shape[0] == 0:
+            per_img_counts.append(0)
             continue
 
         bw_px = boxes[:, 2] * raw_w * scale
         bh_px = boxes[:, 3] * raw_h * scale
+        keep = (bw_px > MIN_CANVAS_BOX_PX) & (bh_px > MIN_CANVAS_BOX_PX)
+        dropped += int((~keep).sum())
+        bw_px, bh_px = bw_px[keep], bh_px[keep]
+        per_img_counts.append(int(keep.sum()))
+        if bw_px.size == 0:
+            continue
+
         ws.extend((bw_px / float(img_w)).tolist())
         hs.extend((bh_px / float(img_h)).tolist())
         ars.extend((bh_px / np.clip(bw_px, 1e-6, None)).tolist())
@@ -229,6 +270,7 @@ def profile_split(root: str, split: str, img_h: int, img_w: int
     st = SplitStats(
         n_images=len(images),
         n_boxes=int(counts.sum()),
+        n_boxes_dropped_subpixel=int(dropped),
         boxes_per_image_mean=float(round(float(counts.mean()) if counts.size else 0.0, 4)),
         boxes_per_image_std=float(round(float(counts.std()) if counts.size else 0.0, 4)),
         boxes_per_image_max=int(counts.max()) if counts.size else 0,
@@ -282,8 +324,17 @@ class DatasetProfile:
     prior_h: float = 0.0
 
     # Fallback until evaluate.py measures the best-F1 threshold on the report
-    # split and writes it back here.
-    deploy_score_thresh: float = 0.30
+    # split and writes it back here. None = not yet measured (F13).
+    deploy_score_thresh: Optional[float] = DEFAULT_DEPLOY_SCORE_THRESH
+
+    baseline_map50: Optional[float] = None
+    baseline_source: str = ""
+
+    # --- preprocessing contract, transported to every consumer (F23) ---
+    flat_field_path: Optional[str] = None
+    clahe_enabled: bool = True
+    clahe_clip: float = 2.0
+    clahe_grid: int = 8
 
     splits: Dict[str, dict] = field(default_factory=dict)
 
@@ -293,7 +344,13 @@ class DatasetProfile:
     def from_root(cls, root: str, img_h: int, img_w: int,
                   strides: Sequence[int] = STRIDES,
                   name: Optional[str] = None,
-                  deploy_score_thresh: float = 0.30) -> "DatasetProfile":
+                  deploy_score_thresh: Optional[float] = DEFAULT_DEPLOY_SCORE_THRESH,
+                  baseline_map50: Optional[float] = None,
+                  baseline_source: str = "",
+                  flat_field_path: Optional[str] = None,
+                  clahe_enabled: bool = True,
+                  clahe_clip: float = 2.0,
+                  clahe_grid: int = 8) -> "DatasetProfile":
         splits: Dict[str, dict] = {}
         all_labels: List[str] = []
         stats: Dict[str, SplitStats] = {}
@@ -313,8 +370,8 @@ class DatasetProfile:
         tr = stats["train"]
         if tr.n_boxes == 0:
             raise RuntimeError(
-                f"train split under {root!r} has zero boxes; priors cannot be "
-                f"derived and TAL would cold-start with no positives")
+                f"train split under {root!r} has zero usable boxes; priors "
+                f"cannot be derived and TAL would cold-start with no positives")
 
         prof = cls(
             name=name or os.path.basename(os.path.normpath(root)),
@@ -322,7 +379,7 @@ class DatasetProfile:
             img_h=int(img_h), img_w=int(img_w),
             strides=[int(s) for s in strides],
             canvas_fingerprint=canvas_fingerprint(img_h, img_w, strides),
-            label_sha256=label_fingerprint(all_labels),
+            label_sha256=label_fingerprint(all_labels, root=root),
             image_geometry_fingerprint=geometry_fingerprint(root, stats.keys()),
             n_train=tr.n_images,
             n_val=stats["val"].n_images if "val" in stats else 0,
@@ -332,7 +389,15 @@ class DatasetProfile:
             n_test_boxes=stats["test"].n_boxes if "test" in stats else 0,
             prior_w=tr.median_w,
             prior_h=tr.median_h,
-            deploy_score_thresh=float(deploy_score_thresh),
+            deploy_score_thresh=(float(deploy_score_thresh)
+                                 if deploy_score_thresh is not None else None),
+            baseline_map50=(float(baseline_map50)
+                            if baseline_map50 is not None else None),
+            baseline_source=str(baseline_source or ""),
+            flat_field_path=(str(flat_field_path) if flat_field_path else None),
+            clahe_enabled=bool(clahe_enabled),
+            clahe_clip=float(clahe_clip),
+            clahe_grid=int(clahe_grid),
             splits=splits,
         )
         return prof
@@ -343,7 +408,7 @@ class DatasetProfile:
         d = os.path.dirname(os.path.abspath(path))
         if d:
             os.makedirs(d, exist_ok=True)
-        # Atomic write: a crash mid-write must not leave a half-parsed profile.
+        # Atomic: a crash mid-write must not leave a half-parsed profile.
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             yaml.safe_dump(asdict(self), fh, sort_keys=False,
@@ -364,27 +429,45 @@ class DatasetProfile:
                   f"{sorted(unknown)}")
         prof = cls(**{k: v for k, v in d.items() if k in known})
         prof.strides = [int(s) for s in prof.strides]
+        # Missing keys silently take dataclass defaults, and prior_w = 0.0
+        # would otherwise surface much later as math.log(0.0) inside
+        # head._init_predictions (F28).
+        if not (0.0 < float(prof.prior_w) < 1.0 and
+                0.0 < float(prof.prior_h) < 1.0):
+            raise RuntimeError(
+                f"profile {path} has prior_w={prof.prior_w} "
+                f"prior_h={prof.prior_h}; both must be in (0, 1). The file is "
+                f"missing its priors or was written by an older version. "
+                f"Regenerate it.")
         return prof
 
-    def verify_fresh(self, root: Optional[str] = None) -> None:
-        """Recompute both fingerprints and compare.
+    def verify_fresh(self, root: Optional[str] = None,
+                     allow_unfingerprinted: bool = False) -> None:
+        """
+        Recompute both fingerprints and compare.
 
-        Geometry drift is a HARD ERROR: image dimensions set the letterbox
-        scale, invalidating prior_w / prior_h and deploy_score_thresh.
-        Label drift is a WARNING: labels get corrected without geometry moving.
+        Geometry drift is a HARD ERROR; label drift is a WARNING. An EMPTY
+        image_geometry_fingerprint is also a hard error by default: it used to
+        pass verification unconditionally, so a profile with no fingerprint
+        silently applied unverified priors.
         """
         r = root or self.root
         if not os.path.isdir(r):
-            if self.image_geometry_fingerprint:
-                raise StaleProfileError(
-                    f"profile '{self.name}' points at root '{r}', which does not "
-                    f"exist")
-            return
+            raise StaleProfileError(
+                f"profile '{self.name}' points at root '{r}', which does not "
+                f"exist. If this is the deployment host (which does not carry "
+                f"the dataset), call apply(..., verify=False).")
         splits = list(self.splits.keys()) or ["train", "val", "test"]
 
         have = str(self.image_geometry_fingerprint or "")
         want = geometry_fingerprint(r, splits)
-        if have and have != want:
+        if not have:
+            if not allow_unfingerprinted:
+                raise StaleProfileError(
+                    f"profile '{self.name}' has an empty "
+                    f"image_geometry_fingerprint; its priors cannot be "
+                    f"verified. Regenerate the profile.")
+        elif have != want:
             raise StaleProfileError(
                 f"image geometry changed since profile '{self.name}' was "
                 f"generated ({have[:16]} -> {want[:16]}). The letterbox "
@@ -403,7 +486,7 @@ class DatasetProfile:
             labels += [label_path_for(p, lbl_dir)
                        for p in list_images(img_dir)]
         have_l = str(self.label_sha256 or "")
-        want_l = label_fingerprint(labels)
+        want_l = label_fingerprint(labels, root=r)
         if have_l and have_l != want_l:
             print(f"[profile] WARNING label contents changed since this "
                   f"profile was generated ({have_l[:16]} -> {want_l[:16]}). "
@@ -417,33 +500,80 @@ class DatasetProfile:
 
     # ------------------------------------------------------------------ #
 
-    def apply(self, cfg: Config, verbose: bool = True) -> Config:
+    def apply(self, cfg: Config, verbose: bool = True,
+              verify: bool = True) -> Config:
         """
-        Push every derived value into the live config, after verifying the
-        canvas fingerprint. Order matters: check_canvas() runs FIRST, because
-        applying canvas-space priors from a different canvas is exactly the
-        failure this module exists to prevent.
+        Push every derived value into the live config.
+
+        ``verify=False`` skips verify_fresh(). Use it on machines that do not
+        host the dataset (the Pi reads only deploy_score_thresh and the
+        preprocessing parameters) and in unit tests with a synthetic root.
+        The CANVAS fingerprint check is NEVER skipped: it costs no I/O and it
+        is the one that silently biases the head's size-prior init.
         """
         check_canvas(cfg, self)
-        self.verify_fresh()
+        # F23: validate priors against the reg-log clamp BEFORE writing any
+        # value to cfg — a profile that cannot seed head.size_pred.bias must
+        # never partially mutate the config. Ordered after check_canvas only
+        # because math.log(0.0) on an empty default profile would raise
+        # ValueError and mask the CanvasMismatchError that check_canvas owns.
+        import math as _math
+        from config import REG_LOG_CLAMP_MIN, REG_LOG_CLAMP_MAX
+        for _label, _prior in (("prior_w", self.prior_w), ("prior_h", self.prior_h)):
+            _lg = _math.log(float(_prior)) if float(_prior) > 0.0 else float("-inf")
+            if not (REG_LOG_CLAMP_MIN < _lg < REG_LOG_CLAMP_MAX):
+                raise RuntimeError(
+                    f"profile '{self.name}': log({_label}) = {_lg:.3f} is outside "
+                    f"the regression log-clamp ({REG_LOG_CLAMP_MIN}, "
+                    f"{REG_LOG_CLAMP_MAX}). head.size_pred.bias would be clamped and "
+                    f"TAL would cold-start with zero positives. "
+                    f"Regenerate the profile at this canvas: "
+                    f"python dataset_profiles.py --root <path> "
+                    f"--img-h {self.img_h} --img-w {self.img_w} --out <out.yaml>")
+        if verify:
+            self.verify_fresh()
+
+        cfg.data.root = str(self.root)
+        cfg.data.profile_applied = True
+        cfg.data.profile_name = str(self.name)
 
         cfg.data.n_train = int(self.n_train)
         cfg.data.n_val = int(self.n_val)
         cfg.data.n_test = int(self.n_test)
         cfg.data.n_train_boxes = int(self.n_train_boxes)
+        # F08 (audit fix): transport the MEASURED zero-padding fraction so
+        # validate_config's F21 letterbox-padding warning can actually fire.
+        cfg.data.train_zero_pad_fraction = float(
+            self.splits.get("train", {}).get("zero_pad_fraction", 1.0))
 
         cfg.model.prior_w = float(self.prior_w)
         cfg.model.prior_h = float(self.prior_h)
 
-        cfg.eval.deploy_score_thresh = float(self.deploy_score_thresh)
+        if self.deploy_score_thresh is not None:
+            cfg.eval.deploy_score_thresh = float(self.deploy_score_thresh)
+        if self.baseline_map50 is not None:
+            cfg.eval.baseline_map50 = float(self.baseline_map50)
+        if self.baseline_source:
+            cfg.eval.baseline_source = str(self.baseline_source)
+
+        # ---- preprocessing contract ----
+        cfg.aug.flat_field_path = (str(self.flat_field_path)
+                                   if self.flat_field_path else None)
+        cfg.aug.clahe_enabled = bool(self.clahe_enabled)
+        cfg.aug.clahe_clip = float(self.clahe_clip)
+        cfg.aug.clahe_grid = int(self.clahe_grid)
 
         if verbose:
             print(f"[profile] applied '{self.name}': "
                   f"{self.n_train}/{self.n_val}/{self.n_test} images, "
-                  f"{self.n_train_boxes} train boxes")
+                  f"{self.n_train_boxes} train boxes"
+                  f"{'' if verify else '  (verify=False)'}")
             print(f"[profile]   prior_w {cfg.model.prior_w:.6f}  "
                   f"prior_h {cfg.model.prior_h:.6f}  "
-                  f"deploy_score_thresh {cfg.eval.deploy_score_thresh:.3f}")
+                  f"deploy_score_thresh {_fmt_thresh(cfg.eval.deploy_score_thresh)}")
+            print(f"[profile]   preprocessing: clahe={cfg.aug.clahe_enabled} "
+                  f"clip={cfg.aug.clahe_clip} grid={cfg.aug.clahe_grid} "
+                  f"flat_field={cfg.aug.flat_field_path!r}")
             if self.label_sha256:
                 print(f"[profile]   label_sha256 {self.label_sha256[:16]}")
         return cfg
@@ -459,9 +589,12 @@ class DatasetProfile:
             f"  canvas     : {self.img_h}x{self.img_w}  strides {tuple(self.strides)}",
             f"  fingerprint: {self.canvas_fingerprint[:16]}",
             f"  labels     : {self.label_sha256[:16]}",
+            f"  geometry   : {self.image_geometry_fingerprint[:16]}",
             f"  priors     : prior_w {self.prior_w:.6f}  prior_h {self.prior_h:.6f}"
             f"   (canvas-space medians, train split)",
-            f"  deploy thr : {self.deploy_score_thresh:.3f}",
+            f"  deploy thr : {_fmt_thresh(self.deploy_score_thresh)}",
+            f"  preprocess : clahe={self.clahe_enabled} clip={self.clahe_clip} "
+            f"grid={self.clahe_grid} flat_field={self.flat_field_path!r}",
             "-" * 76,
         ]
         for split in ("train", "val", "test"):
@@ -473,15 +606,16 @@ class DatasetProfile:
                 f"empty {s['n_images_empty']}  "
                 f"boxes/img {s['boxes_per_image_mean']:.2f}"
                 f" +/- {s['boxes_per_image_std']:.2f} (max {s['boxes_per_image_max']})",
-                f"        w  " + "  ".join(
+                "        w  " + "  ".join(
                     f"{k} {v:.4f}" for k, v in s["w_pct"].items()),
-                f"        h  " + "  ".join(
+                "        h  " + "  ".join(
                     f"{k} {v:.4f}" for k, v in s["h_pct"].items()),
-                f"        ar " + "  ".join(
+                "        ar " + "  ".join(
                     f"{k} {v:.3f}" for k, v in s["ar_pct"].items()),
                 f"        size  small {s['n_small']}  medium {s['n_medium']}  "
                 f"large {s['n_large']}   zero-pad frac "
-                f"{s['zero_pad_fraction']:.3f}",
+                f"{s['zero_pad_fraction']:.3f}   sub-2px dropped "
+                f"{s.get('n_boxes_dropped_subpixel', 0)}",
             ]
         lines.append("=" * 76)
         return "\n".join(lines)
@@ -495,11 +629,9 @@ def check_canvas(cfg: Config, profile: DatasetProfile) -> None:
     """
     Hard error on a canvas fingerprint mismatch.
 
-    This is not pedantry. A profile generated at 384x640 and applied to a
-    512x288 config supplies priors in the wrong units, which shifts
-    head.size_pred.bias, which can push the epoch-0 IoU low enough that TAL
-    assigns nothing. losses.ColdStartError would then fire with a message
-    pointing at the head init, and the actual cause would be a stale YAML.
+    A profile generated at 384x640 and applied to a 512x288 config supplies
+    priors in the wrong units, which shifts head.size_pred.bias, which can
+    push the epoch-0 IoU low enough that TAL assigns nothing.
     """
     want = canvas_fingerprint(cfg.data.img_h, cfg.data.img_w,
                               cfg.model.strides)
@@ -521,9 +653,10 @@ def check_canvas(cfg: Config, profile: DatasetProfile) -> None:
         f"--img-h {cfg.data.img_h} --img-w {cfg.data.img_w} --out <path>")
 
 
-def load_and_apply(path: str, cfg: Config, verbose: bool = True) -> DatasetProfile:
+def load_and_apply(path: str, cfg: Config, verbose: bool = True,
+                   verify: bool = True) -> DatasetProfile:
     prof = DatasetProfile.load(path)
-    prof.apply(cfg, verbose=verbose)
+    prof.apply(cfg, verbose=verbose, verify=verify)
     return prof
 
 
@@ -535,26 +668,51 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description="Profile a YOLO-format NIR pedestrian dataset and write "
                     "the derived-values YAML.")
-    ap.add_argument("--root", default=None,
-                    help="dataset root (default: cfg.data.root)")
+    ap.add_argument("--root", required=True, help="dataset root to profile")
     ap.add_argument("--img-h", type=int, default=None)
     ap.add_argument("--img-w", type=int, default=None)
     ap.add_argument("--strides", type=int, nargs="+", default=None)
     ap.add_argument("--name", default=None)
-    ap.add_argument("--out", default="datasets/miniNIRPed_261.yaml")
+    ap.add_argument("--baseline-map50", type=float, default=None,
+                    help="optional reference mAP50 for this dataset")
+    ap.add_argument("--baseline-source", default="",
+                    help="provenance of --baseline-map50, printed verbatim by "
+                         "evaluate.py (e.g. 'YOLO11n fine-tune, same splits')")
+    ap.add_argument("--flat-field", default=None,
+                    help="flat-field gain map; recorded in the profile so the "
+                         "Pi applies the SAME preprocessing as training")
+    ap.add_argument("--no-clahe", action="store_true",
+                    help="record clahe_enabled=False in the profile")
+    ap.add_argument("--clahe-clip", type=float, default=None)
+    ap.add_argument("--clahe-grid", type=int, default=None)
+    ap.add_argument("--out", default=None,
+                    help="output path (default: datasets/<profile-name>.yaml)")
     args = ap.parse_args()
 
     cfg = get_config()
-    root = args.root or cfg.data.root
+    root = args.root
     img_h = int(args.img_h or cfg.data.img_h)
     img_w = int(args.img_w or cfg.data.img_w)
     strides = tuple(args.strides) if args.strides else tuple(cfg.model.strides)
 
     prof = DatasetProfile.from_root(
         root, img_h, img_w, strides, name=args.name,
-        deploy_score_thresh=float(cfg.eval.deploy_score_thresh))
+        deploy_score_thresh=(float(cfg.eval.deploy_score_thresh)
+                             if cfg.eval.deploy_score_thresh is not None else None),
+        baseline_map50=args.baseline_map50,
+        baseline_source=args.baseline_source,
+        flat_field_path=(args.flat_field
+                         if args.flat_field is not None
+                         else cfg.aug.flat_field_path),
+        clahe_enabled=(not args.no_clahe) and bool(cfg.aug.clahe_enabled),
+        clahe_clip=float(args.clahe_clip if args.clahe_clip is not None
+                         else cfg.aug.clahe_clip),
+        clahe_grid=int(args.clahe_grid if args.clahe_grid is not None
+                       else cfg.aug.clahe_grid),
+    )
     print(prof.table())
-    path = prof.save(args.out)
+    out = args.out or os.path.join("datasets", f"{prof.name}.yaml")
+    path = prof.save(out)
     print(f"\nwrote {path}")
     print("deploy_score_thresh is a FALLBACK until evaluate.py measures the "
           "best-F1 threshold on the report split and writes it back here.")

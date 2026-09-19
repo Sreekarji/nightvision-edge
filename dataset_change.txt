@@ -1,0 +1,13 @@
+Before training on any new dataset — update these 5 values:
+
+prior_w and prior_h in config — re-measure by running the prior measurement script on the new dataset's labels. Current values (0.0461, 0.1680) are from miniNIRPed only.
+ema_tau_steps in TrainCfg — set it as n_train_images // batch_size * 5. Current value (160) is tuned to 261 images at batch 8. On a larger dataset this needs to scale up.
+baseline_map50 in TrainCfg — set to 0.0 or to your actual baseline on the new dataset. Current value (0.735) is the YOLO11n number on miniNIRPed and means nothing elsewhere.
+copy_paste_p in DataCfg — reduce for larger datasets. Current value (0.5) is calibrated for ~300 images. For 2k images use ~0.2, for 10k images use ~0.1.
+Dataset paths (root, checkpoint_dir) — update to point to the new dataset location and output folder.
+
+Missing #1 — warmup_steps in TrainCfg
+Current value: 300. This is step-based (one step = one batch), which is good — it's already dataset-size invariant by design. But at 261 images / batch 8 = ~33 steps/epoch, 300 steps = ~9 epochs of warmup. At 10k images / batch 8 = 1250 steps/epoch, 300 steps = less than 1 epoch — essentially no warmup. Rule: set it to n_train_images // batch_size * 3 to always get ~3 epochs of warmup regardless of dataset size.
+
+Missing #2 — copy_paste_feather in AugCfg
+Current value: 3 pixels. This is tuned to small 29×65px miniNIRPed pedestrians where a 3px feather is ~10% of box width. On a larger dataset with larger objects — pedestrians at closer range, or any NIR dataset with bigger people — the feather stays 3px but the crop is 3× bigger, so the boundary is effectively hard. It should scale with expected box size. Rule: set it to roughly max(2, int(median_box_w_px * 0.08)) from your prior measurement.
