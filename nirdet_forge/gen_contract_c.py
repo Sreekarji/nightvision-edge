@@ -87,7 +87,7 @@ def _cf(v: float) -> str:
 # doubling every one of them is how a generator acquires its own bug class.
 
 _TEMPLATE = r'''/*
- * nirdet_pp.c — NIRDet-Lite post-processor for STM32N6 / Cortex-M55
+ * nirdet_pp.c — NIRDet-Forge post-processor for STM32N6 / Cortex-M55
  * ==================================================================
  * @@BANNER@@
  *
@@ -152,6 +152,14 @@ _TEMPLATE = r'''/*
 #define NIRDET_MAX_LEVELS    @@NIRDET_MAX_LEVELS@@
 #define NIRDET_MAX_DET       @@NIRDET_MAX_DET@@
 
+/* C99 portability: _Static_assert is C11. Many CubeMX projects default to
+ * gnu99. This shim emits a compile-time error via a negative-width bitfield
+ * on pre-C11 toolchains and is a no-op under C11+. */
+#if !defined(__STDC_VERSION__) || (__STDC_VERSION__ < 201112L)
+#define _Static_assert(cond, msg) \
+    typedef char nirdet_static_assert_##__LINE__[(cond) ? 1 : -1]
+#endif
+
 /* Make NIRDET_NUM_CLASSES load-bearing: it is checked by
  * test_decode_contract.py T1 but referenced by no C expression, so an
  * accidental change would otherwise compile silently while the single-class
@@ -171,7 +179,11 @@ typedef struct {
 
 typedef struct {
     /* cls: 1 channel, off: 2 channels (t_cx, t_cy),
-       size: 2 channels (t_w, t_h). Each blob is CHW int8. */
+       size: 2 channels (t_w, t_h). Each blob is CHW int8 with EXACTLY
+       grid_h*grid_w elements per plane and NO inter-plane padding — the
+       decoder indexes channel 1 as [grid_h*grid_w + i]. This holds for the
+       Neural-ART NPU output. It does NOT hold for an ncnn::Mat, whose
+       cstep is 16-byte aligned; repack before calling if you ever feed one. */
     const int8_t *cls;
     const int8_t *off;
     const int8_t *size;

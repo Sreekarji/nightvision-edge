@@ -1,5 +1,5 @@
 """
-losses.py — NIRDet-Lite loss (single class)
+losses.py — NIRDet-Forge loss (single class)
 ============================================
     L = lambda_cls * QFL(conf, target_score) + lambda_reg * CIoU(pos)
 
@@ -508,6 +508,7 @@ class NIRDetLoss(nn.Module):
 
         self._assert_cold_start = bool(assert_cold_start)
         self._cold_start_checked = False
+        self._norm_floor_acc: Optional[torch.Tensor] = None  # P23/S30
 
     # ------------------------------------------------------------------ #
 
@@ -648,10 +649,13 @@ class NIRDetLoss(nn.Module):
 
         # F66: per-epoch floored-batch counter, consumed and reset by
         # train_one_epoch() in train.py.
-        if not hasattr(self, "_norm_floor_count"):
-            self._norm_floor_count = 0
-        if bool(norm_raw.detach() < 1.0):
-            self._norm_floor_count += 1
+        # Accumulate on-device to avoid a device→host sync per step (P23).
+        # Read once per epoch in train.py, then zeroed.
+        device = norm_raw.device
+        if self._norm_floor_acc is None or \
+                self._norm_floor_acc.device != device:
+            self._norm_floor_acc = torch.zeros((), device=device)
+        self._norm_floor_acc += (norm_raw.detach() < 1.0).float()
 
         cls_loss = self.qfl(cls_logits, tgt_scores).sum() / norm
 

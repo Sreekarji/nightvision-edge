@@ -1,5 +1,5 @@
 """
-model.py — NIRDet-Lite
+model.py — NIRDet-Forge
 =======================
     input (B,1,288,512)
       EAA.compute_edge_magnitude  -> e8 (B,4,36,64)   [once per forward]
@@ -24,7 +24,7 @@ import torch.nn as nn
 
 from attention import EdgeAwareAttention
 from backbone import NIRBackbone
-from config import MIN_BOX_PX
+from config import MIN_BOX_PX, PRE_NMS_TOPK, clamp_and_filter_torch
 from head import PedestrianHead
 from neck import LightweightFPN
 
@@ -240,7 +240,6 @@ class NIRDet(nn.Module):
             # F73: the membership half of the decode contract is
             # config.clamp_and_filter_torch — ONE canonical implementation
             # shared with test_decode_contract.py, no independent reimpl.
-            from config import clamp_and_filter_torch
             cx, cy, bw, bh = p[:, 0], p[:, 1], p[:, 2], p[:, 3]
             xyxy = torch.stack([cx - bw * 0.5, cy - bh * 0.5,
                                 cx + bw * 0.5, cy + bh * 0.5], dim=-1)
@@ -248,7 +247,6 @@ class NIRDet(nn.Module):
             # Pre-NMS cap: match the C heap capacity. Without this the
             # Python accuracy gate measures a result the device cannot
             # produce at crowded scenes with low score_thresh.
-            from config import PRE_NMS_TOPK
             if PRE_NMS_TOPK > 0 and scores.shape[0] > PRE_NMS_TOPK:
                 _, top_idx = scores.topk(PRE_NMS_TOPK)
                 boxes, scores = boxes[top_idx], scores[top_idx]
@@ -276,7 +274,7 @@ class NIRDet(nn.Module):
 
     def __repr__(self) -> str:
         b = self.param_breakdown()
-        lines = ["NIRDet-Lite (single class: person)", "=" * 46]
+        lines = ["NIRDet-Forge (single class: person)", "=" * 46]
         for k in ("backbone", "eaa", "neck", "head"):
             lines.append(f"  {k:<9}: {b[k]:>10,}")
         lines += [

@@ -29,6 +29,11 @@ import os
 from typing import Dict, List, Optional, Tuple
 
 import cv2
+# One OpenCV thread process-wide: this module runs inside DataLoader workers
+# (which parallelise at the process level), inside the Pi inference thread,
+# and in calibration scripts. dataset.seed_worker overrides to 0 (fully
+# disabled) inside workers; live_nirdet.py already sets 1 explicitly.
+cv2.setNumThreads(1)
 import numpy as np
 
 IMG_EXTS: Tuple[str, ...] = (".png", ".jpg", ".jpeg", ".bmp", ".tif",

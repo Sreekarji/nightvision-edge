@@ -157,7 +157,12 @@ except ImportError:
     raise SystemExit(
         "dataset_profiles.py requires Pillow: pip install Pillow")
 
-_SIZE_CACHE: dict = {}
+# Bounded LRU: profile_split and geometry_fingerprint each walk the split once
+# sequentially, so the hit rate is near-zero anyway. A fixed cap prevents the
+# dict from holding ~100k entries across a full NIRPed scan.
+from collections import OrderedDict as _OD
+_SIZE_CACHE: "_OD[str, tuple]" = _OD()
+_SIZE_CACHE_MAX = 4096
 
 def _image_size(path: str) -> Tuple[int, int]:
     hit = _SIZE_CACHE.get(path)
@@ -166,6 +171,8 @@ def _image_size(path: str) -> Tuple[int, int]:
     with _PIL_Image.open(path) as im:
         result = (im.height, im.width)
     _SIZE_CACHE[path] = result
+    if len(_SIZE_CACHE) > _SIZE_CACHE_MAX:
+        _SIZE_CACHE.popitem(last=False)
     return result
 
 

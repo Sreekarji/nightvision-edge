@@ -26,8 +26,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from config import Config, get_config, validate_config
-from dataset import (list_images, load_flat_field, preprocess_frame,
-                     resolve_split_dirs)
+from dataset import load_flat_field, preprocess_frame
 # graph_input_name lives in export_onnx (needs only `onnx`), so importing it
 # does not drag the quantisation toolchain into fp32-only consumers. Re-exported
 # here for backward compatibility.
@@ -168,7 +167,7 @@ def verify_exclusions(out_path: str, exclude: List[str]) -> List[str]:
     could be a no-op with no diagnostic.
     """
     if not exclude:
-        return
+            return []
     qm = onnx.load(out_path)
     dq_out = {o for n in qm.graph.node
               if n.op_type == "DequantizeLinear" for o in n.output}
@@ -185,7 +184,7 @@ def verify_exclusions(out_path: str, exclude: List[str]) -> List[str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="INT8 QDQ quantization of the NIRDet-Lite ONNX graph.")
+        description="INT8 QDQ quantization of the NIRDet-Forge ONNX graph.")
     ap.add_argument("--onnx", default=None,
                     help="fp32 ONNX (default: cfg.export.onnx_sim_path)")
     ap.add_argument("--out", default=None,
@@ -206,9 +205,16 @@ def main() -> int:
     args = ap.parse_args()
 
     cfg = get_config()
-    if args.profile:
-        from dataset_profiles import DatasetProfile
-        DatasetProfile.load(args.profile).apply(cfg)
+    if not args.profile:
+        raise SystemExit(
+            "--profile is required: INT8 calibration reads real training "
+            "images through the exact training preprocessing, so it needs "
+            "cfg.data.root, the CLAHE settings and the flat-field map. The "
+            "contract sidecar written beside the INT8 graph hashes all of "
+            "them.\n"
+            "  python quantize_qdq.py --onnx <graph> --profile datasets/<n>.yaml")
+    from dataset_profiles import DatasetProfile
+    DatasetProfile.load(args.profile).apply(cfg)
     validate_config(cfg)
 
     fp32 = args.onnx or (

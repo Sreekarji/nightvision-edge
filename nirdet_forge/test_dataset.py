@@ -42,8 +42,11 @@ def _synth_ds_dir(n_images: int = 12, h: int = 300, w: int = 400,
                   splits: Tuple[str, ...] = ("train", "val", "test")
                   ) -> str:
     """A minimal YOLO-layout dataset of noise images with one box each."""
+    import atexit
+    import shutil
     import cv2
     root = tempfile.mkdtemp(prefix="nirdet_test_ds_")
+    atexit.register(shutil.rmtree, root, ignore_errors=True)
     rng = np.random.default_rng(7)
     for sp in splits:
         os.makedirs(os.path.join(root, "images", sp), exist_ok=True)

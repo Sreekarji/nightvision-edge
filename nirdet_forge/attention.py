@@ -7,8 +7,8 @@ RANGE LEDGER
 * DenseResBlock output (backbone F5/F6): [0, 12] per stage; [0, 18] after a
   two-block stage. Clamped to [0, 6] by backbone.DenseResBlock.forward.
 * EAA apply_to output: feat*(0.5+attn) clamped to [0,6] (this file,
-  apply_to). Range-preserving: gate is monotone across the full [0,6]
-  input range. At attn=0.5 (calibrated mean) it is the identity.
+  apply_to). Monotone in feat; amplification is clipped above feat=4
+  (see apply_to). At attn=0.5 (calibrated mean) it is the identity.
 * FPN fusions (neck F78): td4 = l4+up5, td3 = l3+up4 are unactivated.
   Clamped by neck.LightweightFPN when fuse_clip=True (neck.py).
 All three clamps are ONNX Clip nodes, unconditionally HW-mapped on
@@ -77,11 +77,13 @@ def _edge_templates_canonical() -> list:
     return out
 
 
-# Seed templates, in priority order. At default N=4 ALL four slots are seeded
-# (there are exactly 4 templates used); none stay Kaiming-uniform at N=4.
-# Each template is rescaled to the std of the Kaiming-initialised slots it
-# replaces so the seeded and random filters enter the pipeline at equal
-# magnitude. At N=6 the last two slots stay Kaiming-uniform.
+# Seed templates, in priority order. SIX are available (Sobel-x, Sobel-y, the
+# two diagonals, the 4-neighbour Laplacian and the 8-neighbour Laplacian).
+# At the default N=4 the FIRST FOUR slots are seeded and no slot stays
+# Kaiming-uniform; at N=6 all six are seeded; only N>6 leaves the surplus
+# slots Kaiming-uniform. Each template is rescaled to the std of the
+# Kaiming-initialised slot it replaces so seeded and random filters enter the
+# pipeline at equal magnitude.
 _TEMPLATES: List[torch.Tensor] = [t.unsqueeze(0) for t in _edge_templates_canonical()]
 
 
@@ -146,7 +148,11 @@ class EdgeAwareAttention(nn.Module):
 
         self.N = int(num_edge_filters)
         self.freeze_epochs = int(freeze_epochs)
-        self.residual_scale = residual_scale
+        # Flag, not a gain: the numeric value is never used in any expression.
+        # Kept as Optional[float] in the signature for config back-compat;
+        # any non-None value selects the residual gate path.
+        self.residual_gate: bool = residual_scale is not None
+        self.residual_scale = residual_scale   # deprecated alias
         self.normalize_edges = bool(normalize_edges)
         self.padding_mode = padding_mode
         self.edge_stride = int(edge_stride)
@@ -164,8 +170,12 @@ class EdgeAwareAttention(nn.Module):
         self.register_buffer("_epoch_buf", torch.zeros(1, dtype=torch.long))
         self.register_buffer("_calibrated", torch.zeros(1, dtype=torch.long))
         self.register_buffer("_gate_span", torch.zeros(1))
-        if proj_bias is not None:
-            self._calibrated.fill_(1)
+        # DO NOT mark calibrated here. calibrate_bias() sets BOTH the gain
+        # (proj.weight *= k) and the bias; a caller-supplied proj_bias sets
+        # only the bias and leaves proj.weight at its unit-sum init — exactly
+        # the inert gate calibration exists to remove. _calibrated is a
+        # registered buffer, so a real calibration is restored from the
+        # checkpoint by load_state_dict on every eval/export/deploy path.
         self._update_grad_state()
 
     # ------------------------------------------------------------------ #
@@ -282,7 +292,6 @@ class EdgeAwareAttention(nn.Module):
             self._calibrated.fill_(1)
 
             if verbose:
-                rs = 1.0 if self.residual_scale is None else float(self.residual_scale)
                 print(f"[eaa] calibrated on {img.shape[0]} image(s): "
                       f"mean {mean:.5f}  std {std:.5f}  k={k:.2f}  "
                       f"proj.bias {bias:+.5f}  gate_span {span:.4f}")
@@ -417,6 +426,11 @@ class EdgeAwareAttention(nn.Module):
                     f"feature {hf}x{wf}")
             if he > hf or we > wf:
                 # Edge map coarser-or-equal in at least one axis -> POOL.
+                if he < hf or we < wf:
+                    raise ValueError(
+                        f"mixed resample ratio between edge map {he}x{we} and "
+                        f"feature {hf}x{wf}: one axis needs pooling and the "
+                        f"other upsampling, which no single factor can express")
                 if he % hf or we % wf:
                     raise ValueError(
                         f"non-integral pool ratio from edge map {he}x{we} to "
@@ -449,7 +463,7 @@ class EdgeAwareAttention(nn.Module):
                 )
 
         attn = torch.sigmoid(self.proj(e_map))          # (B, 1, Hf, Wf)
-        if self.residual_scale is not None:
+        if self.residual_gate:
             # RANGE-PRESERVING GATE (replaces feat*(1+2*attn) clamped to 6).
             #
             # The old form: feat*(1+2*attn) clamped to 6. For feat in [0,6]
@@ -461,16 +475,23 @@ class EdgeAwareAttention(nn.Module):
             #   attn=0  -> feat * 0.5  (suppress)
             #   attn=0.5 -> feat * 1.0  (identity, the calibrated mean)
             #   attn=1  -> feat * 1.5  (amplify)
-            # Output range is [0, 9] before the clamp, so feat=6 contributes
-            # gate * 6 with gate in (0.5, 1.5) — monotone across the full
-            # input range. ONNX Clip node, HW-mapped on Neural-ART and NCNN.
+            # Output range is [0, 9] before the clamp. The clamp to 6 means
+            # the AMPLIFYING half of the gate is truncated for feat > 4 and
+            # fully inert at feat = 6 (any attn >= 0.5 yields exactly 6.0).
+            # Suppression is unaffected at every feat. The gate is therefore
+            # monotone in feat but ASYMMETRIC in attn above feat = 4.
+            # See the RANGE LEDGER note at the top of this file.
             #
             # TRAINED-NUMERICS DECISION: must be set before the first training
             # run. The weight-decay exemption for eaa.proj.weight in train.py
             # is still load-bearing.
             out = feat * (0.5 + attn)
             return torch.clamp(out, 0.0, 6.0)   # ONNX Clip, HW-mapped
-        return feat * attn
+        # Pure-gate path: feat in [0,6] and attn in (0,1), so the product is
+        # already inside [0,6]. Clamp anyway so the RANGE LEDGER above holds
+        # for BOTH branches and the INT8 activation range is identical
+        # whichever one is configured. ONNX Clip, HW-mapped.
+        return torch.clamp(feat * attn, 0.0, 6.0)
 
     def forward(self, feat: torch.Tensor, img: torch.Tensor) -> torch.Tensor:
         """Convenience path; recomputes the edge map. Prefer the two-step API."""
@@ -510,7 +531,7 @@ if __name__ == "__main__":
 
     print("total edge stride:", eaa.total_edge_stride)
     print("seeded templates :", min(eaa.N, len(_TEMPLATES)), "of",
-          len(_TEMPLATES), "(the rest stay Kaiming-uniform)")
+          len(_TEMPLATES), "available (surplus slots stay Kaiming-uniform)")
     print("calibrated before:", eaa.is_calibrated)
     eaa.calibrate_bias(img)
     print("calibrated after :", eaa.is_calibrated,
@@ -524,4 +545,3 @@ if __name__ == "__main__":
     print("P3", tuple(eaa.apply_to(torch.randn(4, 48, 36, 64), e8).shape))
     print("P4", tuple(eaa.apply_to(torch.randn(4, 64, 18, 32), e8).shape))
     print("P5", tuple(eaa.apply_to(torch.randn(4, 64, 9, 16), e8).shape))
-    print("params", sum(p.numel() for p in eaa.parameters()))

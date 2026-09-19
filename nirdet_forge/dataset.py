@@ -1,52 +1,32 @@
 """
 dataset.py — NIRPed-format loader and the PREPROCESSING CONTRACT
 ==================================================================
-This file owns the preprocessing chain. Four consumers must apply it
-identically, and all four import from here rather than reimplementing:
+The preprocessing chain itself lives in preprocess.py (numpy+cv2 only) and is
+re-exported here. Four consumers apply it identically: this file, quantize_qdq,
+evaluate_onnx and live_nirdet.
 
-    dataset.py        training / validation     (this file)
-    quantize_qdq.py   INT8 calibration
-    evaluate_onnx.py  INT8 evaluation
-    live_nirdet.py    Pi 5 deployment
-
-THE CHAIN, IN ORDER
--------------------
-    1. read as single-channel uint8          (850 nm reflective NIR)
-    2. flat-field correction  (optional)     multiplicative, RAW resolution
-    3. CLAHE                  (switch)       tile-local, RAW resolution
-    4. letterbox to 512x288                  fixed canvas
-    5. /255 -> float32 [0, 1]
-    6. augmentation                          TRAINING ONLY, inside the canvas
-
-Steps 2 and 3 run at raw resolution because both are illumination corrections
-defined against the sensor's own geometry. Step 4 runs BEFORE augmentation so
-every geometric augmentation is expressed in canvas coordinates — the same
-coordinates the loss, the head grid and the on-device decoder use.
-
-clahe_enabled IS A SWITCH, NOT A PROBABILITY. It is applied to train, val,
-test and deployment alike, and it is part of the hashed deploy contract.
-
-LABEL CACHE
------------
-__init__ scans every label file exactly once and caches per-file box counts.
-__getitem__ never touches a label file it has not already parsed.
-
-PATCH CACHE
------------
-Copy-paste draws from a bounded cache of extracted pedestrian CROPS, not from
-a second full decode per attempt (F17). At copy_paste_p = 0.5 and up to 3
-objects the old path added ~1.5 extra full decode+CLAHE+letterbox passes per
-sample, on exactly the small-dataset configuration where copy-paste is
-enabled.
+SCALE NOTES (NIRPed val split used as train set, ~10-100x miniNIRPed)
+---------------------------------------------------------------------
+* The label cache key is (root-relative path, size, mtime_ns) per label file,
+  NOT the file CONTENTS. Hashing contents re-read every label byte on every
+  DataLoader construction — at 100k labels that is the same I/O the cache was
+  supposed to avoid, paid three times per run (train/val/test loaders).
+* The cache is written next to the dataset if writable, otherwise into a
+  per-user temp directory: a 38 GB dataset is very often on a read-only mount.
+* read_yolo_labels' per-file "dropped boxes" print is rate-limited; at 100k
+  files an unconditional print is megabytes of log noise that hides real
+  warnings.
+* The copy-paste patch cache is bounded by COUNT and the paste pool is an
+  index list, both independent of dataset size.
 """
 
 from __future__ import annotations
 
-import glob
 import hashlib
 import math
 import os
 import random
+import tempfile
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -55,22 +35,16 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from config import Config, copy_paste_p_for, get_config
-from preprocess import *          # F57: chain lives in preprocess.py
+from preprocess import *          # chain lives in preprocess.py
 from preprocess import (IMG_EXTS, _ROOT_UNSET_MSG, _SPLIT_ALIASES,
                         apply_clahe, apply_flat_field, letterbox,
                         list_images, load_flat_field, preprocess_frame,
                         resolve_split_dirs)
 
-# cv2.setNumThreads(0) is set in seed_worker — WORKERS ONLY (F18). The main
-# process and other importers (evaluate.py, export_ncnn.py, quantize_qdq.py)
-# do single-image imread/resize/CLAHE calls and benefit from OpenCV's default
-# threading.
+# cv2.setNumThreads(0) is set in seed_worker — WORKERS ONLY.
 
-
-# ===========================================================================
-# STANDALONE PREPROCESSING — lives in preprocess.py (F57), re-exported above.
-# Import these, never reimplement them.
-# ===========================================================================
+_LABEL_WARN_BUDGET = 20
+_label_warns_emitted = 0
 
 
 def label_path_for(img_path: str, label_dir: str) -> str:
@@ -78,13 +52,20 @@ def label_path_for(img_path: str, label_dir: str) -> str:
     return os.path.join(label_dir, stem + ".txt")
 
 
-def read_yolo_labels(path: str) -> np.ndarray:
-    """
-    Read a YOLO label file -> (N, 4) float32 of normalised (cx, cy, w, h).
+def _label_warn(msg: str) -> None:
+    """Rate-limited label warning: unbounded prints do not scale to 100k files."""
+    global _label_warns_emitted
+    if _label_warns_emitted < _LABEL_WARN_BUDGET:
+        print(msg)
+    elif _label_warns_emitted == _LABEL_WARN_BUDGET:
+        print(f"[labels] ... further per-file label warnings suppressed "
+              f"(> {_LABEL_WARN_BUDGET}); totals are reported by "
+              f"dataset_profiles.py")
+    _label_warns_emitted += 1
 
-    Single class: the class column is parsed and discarded. Degenerate and
-    out-of-range boxes are dropped here rather than poisoning the priors.
-    """
+
+def read_yolo_labels(path: str) -> np.ndarray:
+    """YOLO label file -> (N,4) float32 normalised (cx,cy,w,h). Class dropped."""
     if not os.path.isfile(path):
         return np.zeros((0, 4), dtype=np.float32)
     out: List[List[float]] = []
@@ -97,15 +78,26 @@ def read_yolo_labels(path: str) -> np.ndarray:
                 continue
             parts = line.replace(",", " ").split()
             if len(parts) < 5:
-                raise RuntimeError(
-                    f"malformed label {path}:{ln}: expected "
-                    f"'cls cx cy w h', got {line!r}")
+                _label_warn(f"[labels] {os.path.basename(path)}:{ln}: "
+                            f"malformed line dropped (expected "
+                            f"'cls cx cy w h', got {line!r})")
+                n_raw += 1
+                n_dropped += 1
+                continue
             try:
                 cx, cy, w, h = (float(parts[1]), float(parts[2]),
                                 float(parts[3]), float(parts[4]))
             except ValueError as exc:
-                raise RuntimeError(f"malformed label {path}:{ln}: {exc}") from exc
+                _label_warn(f"[labels] {os.path.basename(path)}:{ln}: "
+                            f"unparseable field dropped ({exc})")
+                n_raw += 1
+                n_dropped += 1
+                continue
             n_raw += 1
+            if not (math.isfinite(cx) and math.isfinite(cy)
+                    and math.isfinite(w) and math.isfinite(h)):
+                n_dropped += 1
+                continue
             if w <= 0.0 or h <= 0.0:
                 n_dropped += 1
                 continue
@@ -115,16 +107,15 @@ def read_yolo_labels(path: str) -> np.ndarray:
             out.append([cx, cy, w, h])
     if not out:
         if n_dropped > 0:
-            print(f"[labels] {os.path.basename(path)}: "
-                  f"dropped {n_dropped}/{n_raw} boxes (degenerate or out-of-range)")
+            _label_warn(f"[labels] {os.path.basename(path)}: dropped "
+                        f"{n_dropped}/{n_raw} boxes (degenerate/out-of-range)")
         return np.zeros((0, 4), dtype=np.float32)
     boxes = np.asarray(out, dtype=np.float32)
     keep = (boxes[:, 2] <= 1.5) & (boxes[:, 3] <= 1.5)
-    n_size_dropped = int((~keep).sum())
-    total_dropped = n_dropped + n_size_dropped
+    total_dropped = n_dropped + int((~keep).sum())
     if total_dropped > 0:
-        print(f"[labels] {os.path.basename(path)}: "
-              f"dropped {total_dropped}/{n_raw} boxes (degenerate or out-of-range)")
+        _label_warn(f"[labels] {os.path.basename(path)}: dropped "
+                    f"{total_dropped}/{n_raw} boxes (degenerate/out-of-range)")
     return boxes[keep]
 
 
@@ -162,7 +153,6 @@ def _xyxy_px_to_cxcywh(b: np.ndarray, h: int, w: int) -> np.ndarray:
 
 
 def _iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """a (M,4) xyxy, b (N,4) xyxy -> (M,N)."""
     if a.shape[0] == 0 or b.shape[0] == 0:
         return np.zeros((a.shape[0], b.shape[0]), dtype=np.float32)
     lt = np.maximum(a[:, None, :2], b[None, :, :2])
@@ -175,41 +165,46 @@ def _iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 # ===========================================================================
-# Dataset
+# label cache
 # ===========================================================================
 
 def _label_scan_fingerprint(label_files: List[str], root: str = "") -> str:
     """
-    Content fingerprint of the label files behind a dataset split, mirroring
-    dataset_profiles.label_fingerprint (root-relative paths hashed) so a file
-    moved between splits invalidates the on-disk label cache (F19). Lives in
-    dataset.py to avoid an import cycle with dataset_profiles.
+    STAT-based fingerprint: (root-relative path, size, mtime_ns) per file.
+
+    Content hashing read every label byte on every construction, which is the
+    cost the cache exists to remove. A stat() is ~100x cheaper and still
+    detects edits, additions, removals and cross-split moves.
     """
     h = hashlib.sha256()
     for p in sorted(label_files):
         rel = (os.path.relpath(p, root).replace("\\", "/")
                if root else os.path.basename(p))
-        rel_b = rel.encode("utf-8")
-        h.update(len(rel_b).to_bytes(4, "big"))
-        h.update(rel_b)
+        h.update(rel.encode("utf-8"))
         try:
-            with open(p, "rb") as fh:
-                h.update(fh.read())
+            st = os.stat(p)
+            h.update(f"|{st.st_size}|{st.st_mtime_ns}\n".encode("utf-8"))
         except OSError:
-            pass
+            h.update(b"|missing\n")
     return h.hexdigest()
+
+
+def _cache_candidates(root: str, split: str) -> List[str]:
+    """Dataset-local path first, then a per-user temp path (read-only mounts)."""
+    local = os.path.join(root, f".labelcache-{split}.npz")
+    digest = hashlib.sha256(os.path.abspath(root).encode("utf-8")).hexdigest()[:12]
+    tmp = os.path.join(tempfile.gettempdir(),
+                       f"nirdet-labelcache-{digest}-{split}.npz")
+    return [local, tmp]
 
 
 class NIRPedDataset(Dataset):
     """
-    Single-class NIR pedestrian dataset (YOLO directory layout).
-
-    __getitem__ -> (img (1, H, W) float32 in [0,1],
-                    boxes (N, 4) float32 canvas-normalised (cx, cy, w, h),
+    __getitem__ -> (img (1,H,W) float32 [0,1],
+                    boxes (N,4) canvas-normalised (cx,cy,w,h),
                     meta dict)
     """
 
-    # Bounded LRU for copy-paste source crops.
     _PATCH_CACHE_MAX = 64
 
     def __init__(self, cfg: Config, split: str = "train",
@@ -232,67 +227,78 @@ class NIRPedDataset(Dataset):
         if not self.images:
             raise RuntimeError(f"no images found in {self.img_dir}")
 
-        # ---- flat-field, loaded once ----
         self.flat_field = load_flat_field(cfg.aug.flat_field_path)
 
-        # ---- single label scan, with an on-disk cache (F19) ----
-        # Cache the scan result so repeated DataLoader constructions (evaluate.py,
-        # quantize_qdq.py, multiple train/val loaders) pay the scan cost once.
-        # Keyed by a content fingerprint of the label files, root-relative.
         root = cfg.data.root
-        _cache_path = os.path.join(root, f".labelcache-{split}.npz")
         label_files = [label_path_for(p, self.label_dir) for p in self.images]
-        _cache_key = _label_scan_fingerprint(label_files, root)
-        _labels_from_cache = None
-        try:
-            _cached = np.load(_cache_path, allow_pickle=True)
-            if str(_cached.get("key", "")) == _cache_key:
-                # Cache hit: restore the pre-parsed arrays. NOTE (F15):
-                # computing _cache_key already READ every label file's bytes,
-                # so this saves the PARSE (read_yolo_labels' per-line float
-                # conversion), not the I/O. On many small label files the
-                # I/O, not the parse, dominates.
-                imgs_c = list(_cached["images"])
-                labs_c = list(_cached["labels"])
-                if [str(p) for p in imgs_c] == [str(p) for p in self.images]:
-                    _labels_from_cache = {str(p): np.asarray(l, dtype=np.float32)
-                                          for p, l in zip(imgs_c, labs_c)}
-                else:
-                    raise KeyError("image list changed")
-        except Exception:
-            _labels_from_cache = None
+        cache_key = _label_scan_fingerprint(label_files, root)
+        paths = _cache_candidates(root, split)
+
+        labels_from_cache = None
+        for cp in paths:
+            try:
+                cached = np.load(cp, allow_pickle=True)
+            except Exception:
+                continue
+            try:
+                if str(cached["key"]) != cache_key:
+                    continue
+                imgs_c = [str(p) for p in list(cached["images"])]
+                if imgs_c != [str(p) for p in self.images]:
+                    continue
+                labs_c = list(cached["labels"])
+                labels_from_cache = {
+                    p: np.asarray(l, dtype=np.float32).reshape(-1, 4)
+                    for p, l in zip(imgs_c, labs_c)}
+                break
+            except Exception:
+                continue
 
         self._labels: Dict[str, np.ndarray] = {}
         self._box_counts: Dict[str, int] = {}
         total_boxes = 0
-        if _labels_from_cache is not None:
+        if labels_from_cache is not None:
             for p in self.images:
-                lb = _labels_from_cache[p]
+                lb = labels_from_cache[p]
                 self._labels[p] = lb
                 self._box_counts[p] = int(lb.shape[0])
                 total_boxes += int(lb.shape[0])
         else:
-            # Cache miss or unreadable: run the full scan, then write atomically.
-            for p in self.images:
+            n = len(self.images)
+            report = max(1, n // 10)
+            for i, p in enumerate(self.images, 1):
                 lb = read_yolo_labels(label_path_for(p, self.label_dir))
                 self._labels[p] = lb
                 self._box_counts[p] = int(lb.shape[0])
                 total_boxes += int(lb.shape[0])
-            try:
-                # np.savez appends ".npz" unless the name already ends with it;
-                # name the tmp file so the final path IS the cache path.
-                tmp = _cache_path + f".tmp-{os.getpid()}"
-                np.savez(tmp, key=np.array(_cache_key),
-                         images=np.array(self.images, dtype=object),
-                         labels=np.array([self._labels[p] for p in self.images],
-                                         dtype=object))
-                os.replace(tmp + ".npz", _cache_path)
-            except OSError as exc:
-                print(f"[data] WARNING label cache write failed "
-                      f"({_cache_path}): {exc}; continuing uncached")
+                if n > 5000 and (i % report == 0 or i == n):
+                    print(f"[data] label scan {split}: {i}/{n}", flush=True)
+            wrote = False
+            if limit is not None:
+                # A truncated scan must never overwrite the full-split cache:
+                # the key embeds the image list, so a 10-image --overfit-test
+                # invalidates the full cache and forces a complete rescan on
+                # the next real run.
+                wrote = True
+                print(f"[data] label cache not written (limit={int(limit)})")
+            for cp in (paths if limit is None else []):
+                try:
+                    tmp = cp + f".tmp-{os.getpid()}"
+                    np.savez(tmp, key=np.array(cache_key),
+                             images=np.array(self.images, dtype=object),
+                             labels=np.array([self._labels[p]
+                                              for p in self.images],
+                                             dtype=object))
+                    os.replace(tmp + ".npz", cp)
+                    wrote = True
+                    break
+                except OSError:
+                    continue
+            if not wrote:
+                print(f"[data] WARNING label cache not writable "
+                      f"({paths[0]} / {paths[1]}); continuing uncached")
         self.n_boxes = int(total_boxes)
 
-        # ---- copy-paste probability is DERIVED, never hardcoded ----
         declared = int(getattr(cfg.data, "n_train_boxes", 0) or 0)
         self.n_train_boxes = declared if declared > 0 else self.n_boxes
         self._copy_paste_p = (
@@ -301,24 +307,14 @@ class NIRPedDataset(Dataset):
             if self.augment else 0.0)
 
         self._paste_indices: List[int] = [
-            i for i, p in enumerate(self.images) if self._box_counts[p] > 0
-        ]
-        # Bounded crop cache, populated lazily (F17).
-        self._patch_cache: Dict[int, List[np.ndarray]] = {}
+            i for i, p in enumerate(self.images) if self._box_counts[p] > 0]
+        self._patch_cache: Dict[int, List[Tuple[np.ndarray, int]]] = {}
         self._epoch: int = 0
 
     def set_epoch(self, epoch: int) -> None:
-        """
-        Call at the top of every epoch in train.py.
-
-        LOAD-BEARING, and only effective because build_dataloader disables
-        persistent_workers on the augmented train split (F14). Workers hold a
-        pickled copy of this object made once at worker start, so a mutation
-        here reaches them only if the workers are respawned.
-        """
+        """Call at the top of every epoch. Only reaches workers because
+        build_dataloader keeps persistent_workers off for augmented splits."""
         self._epoch = int(epoch)
-
-    # ------------------------------------------------------------------ #
 
     def __len__(self) -> int:
         return len(self.images)
@@ -331,12 +327,9 @@ class NIRPedDataset(Dataset):
         return dict(self._box_counts)
 
     def _paste_pool(self) -> List[int]:
-        """Indices of images known to contain at least one box. Cache only."""
         return self._paste_indices
 
-    # ------------------------------------------------------------------ #
-    # base sample: chain steps 1-5, no augmentation
-    # ------------------------------------------------------------------ #
+    # ---------------- base sample: chain steps 1-5 ----------------
 
     def _load_base(self, idx: int) -> Tuple[np.ndarray, np.ndarray, dict]:
         path = self.images[idx]
@@ -354,25 +347,20 @@ class NIRPedDataset(Dataset):
             clahe_grid=int(self.aug.clahe_grid),
             flat_field=self.flat_field,
         )
-
         boxes = boxes_to_canvas(self._labels[path], raw_h, raw_w,
                                 self.img_h, self.img_w, scale, pad_x, pad_y)
         meta = {"img_path": path, "raw_h": raw_h, "raw_w": raw_w,
                 "scale": float(scale), "pad_x": int(pad_x), "pad_y": int(pad_y)}
         return canvas, boxes, meta
 
-    # ------------------------------------------------------------------ #
-    # augmentation, all inside the fixed canvas
-    # ------------------------------------------------------------------ #
+    # ---------------- augmentation, inside the canvas ----------------
 
     def _augment(self, img: np.ndarray, boxes: np.ndarray,
                  rng: random.Random, idx: int = -1,
                  npg: Optional[np.random.Generator] = None
                  ) -> Tuple[np.ndarray, np.ndarray]:
         a = self.aug
-        # Defensive copy: _cutout and _copy_paste mutate img in place.
         img = img.copy()
-
         if npg is None:
             npg = np.random.default_rng()
 
@@ -412,7 +400,7 @@ class NIRPedDataset(Dataset):
                           0.0, 1.0)
 
         if rng.random() < a.cutout_p:
-            img = self._cutout(img, rng)
+            img = self._cutout(img, rng, boxes)
 
         return np.ascontiguousarray(img, dtype=np.float32), boxes
 
@@ -440,7 +428,6 @@ class NIRPedDataset(Dataset):
 
         out = cv2.warpAffine(img, M[:2], (w, h), flags=cv2.INTER_LINEAR,
                              borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
-
         if boxes.shape[0] == 0:
             return out, boxes
 
@@ -451,10 +438,9 @@ class NIRPedDataset(Dataset):
             np.stack([xyxy[:, 2], xyxy[:, 1]], 1),
             np.stack([xyxy[:, 2], xyxy[:, 3]], 1),
             np.stack([xyxy[:, 0], xyxy[:, 3]], 1),
-        ], axis=1).reshape(-1, 2)                      # (4N, 2)
+        ], axis=1).reshape(-1, 2)
         ones = np.ones((corners.shape[0], 1), dtype=np.float32)
-        warped = (np.concatenate([corners, ones], 1) @ M.T)[:, :2]
-        warped = warped.reshape(n, 4, 2)
+        warped = (np.concatenate([corners, ones], 1) @ M.T)[:, :2].reshape(n, 4, 2)
 
         x1 = warped[:, :, 0].min(1)
         x2 = warped[:, :, 0].max(1)
@@ -462,19 +448,15 @@ class NIRPedDataset(Dataset):
         y2 = warped[:, :, 1].max(1)
 
         area_before = np.clip(x2 - x1, 0, None) * np.clip(y2 - y1, 0, None)
-        x1c = np.clip(x1, 0, w)
-        x2c = np.clip(x2, 0, w)
-        y1c = np.clip(y1, 0, h)
-        y2c = np.clip(y2, 0, h)
-        bw = x2c - x1c
-        bh = y2c - y1c
+        x1c, x2c = np.clip(x1, 0, w), np.clip(x2, 0, w)
+        y1c, y2c = np.clip(y1, 0, h), np.clip(y2, 0, h)
+        bw, bh = x2c - x1c, y2c - y1c
         area_after = np.clip(bw, 0, None) * np.clip(bh, 0, None)
 
         keep = (bw > 2.0) & (bh > 2.0) & \
                (area_after > 0.2 * np.maximum(area_before, 1e-6))
         if not bool(keep.any()):
             return out, np.zeros((0, 4), dtype=np.float32)
-
         kept = np.stack([x1c, y1c, x2c, y2c], 1)[keep]
         return out, _xyxy_px_to_cxcywh(kept, h, w)
 
@@ -492,31 +474,39 @@ class NIRPedDataset(Dataset):
         kern /= float(kern.sum())
         return cv2.filter2D(img, -1, kern)
 
-    def _cutout(self, img: np.ndarray, rng: random.Random) -> np.ndarray:
+    def _cutout(self, img: np.ndarray, rng: random.Random,
+                boxes: Optional[np.ndarray] = None) -> np.ndarray:
         h, w = self.img_h, self.img_w
-        # Fixed neutral fill so the cutout patch is scene-independent.
-        # img is in [0, 1] after preprocessing; 0.5 is the mid-grey used by
-        # standard cutout implementations.
         fill = 0.5
+        xy = (cxcywh_to_xyxy_px(boxes, h, w)
+              if boxes is not None and boxes.shape[0] else None)
         for _ in range(rng.randint(1, 3)):
-            cw = rng.randint(max(4, w // 32), max(8, w // 8))
-            ch = rng.randint(max(4, h // 32), max(8, h // 8))
-            x0 = rng.randint(0, max(0, w - cw))
-            y0 = rng.randint(0, max(0, h - ch))
-            img[y0:y0 + ch, x0:x0 + cw] = fill
+            for _attempt in range(8):
+                cw = rng.randint(max(4, w // 32), max(8, w // 8))
+                ch = rng.randint(max(4, h // 32), max(8, h // 8))
+                x0 = rng.randint(0, max(0, w - cw))
+                y0 = rng.randint(0, max(0, h - ch))
+                if xy is not None:
+                    cand = np.array([[x0, y0, x0 + cw, y0 + ch]],
+                                    dtype=np.float32)
+                    ix1 = np.maximum(cand[0, 0], xy[:, 0])
+                    iy1 = np.maximum(cand[0, 1], xy[:, 1])
+                    ix2 = np.minimum(cand[0, 2], xy[:, 2])
+                    iy2 = np.minimum(cand[0, 3], xy[:, 3])
+                    inter = (np.clip(ix2 - ix1, 0, None) *
+                             np.clip(iy2 - iy1, 0, None))
+                    area = (np.clip(xy[:, 2] - xy[:, 0], 1e-6, None) *
+                            np.clip(xy[:, 3] - xy[:, 1], 1e-6, None))
+                    # Never occlude more than 60% of any labelled box.
+                    if float((inter / area).max()) > 0.60:
+                        continue
+                img[y0:y0 + ch, x0:x0 + cw] = fill
+                break
         return img
 
-    # ------------------------------------------------------------------ #
-    # copy-paste (patch cache, F17)
-    # ------------------------------------------------------------------ #
+    # ---------------- copy-paste (bounded patch cache) ----------------
 
     def _crops_for(self, j: int) -> List[Tuple[np.ndarray, int]]:
-        """Extract and cache every pedestrian crop of source image ``j``.
-
-        Each entry is (crop, row) where row is the vertical centre of the
-        source crop — copy-paste uses it to preserve the scale/row correlation
-        of a fixed-mount camera (F16).
-        """
         cached = self._patch_cache.get(j)
         if cached is not None:
             return cached
@@ -530,8 +520,6 @@ class NIRPedDataset(Dataset):
             y2 = max(y1 + 2, min(int(b[3]), self.img_h))
             c = img[y1:y2, x1:x2]
             if c.size:
-                # Record the vertical centre of the source crop alongside the
-                # crop itself.
                 crops.append((np.ascontiguousarray(c), int((y1 + y2) // 2)))
         if len(self._patch_cache) >= self._PATCH_CACHE_MAX:
             self._patch_cache.pop(next(iter(self._patch_cache)))
@@ -540,20 +528,14 @@ class NIRPedDataset(Dataset):
 
     def _paste_patch(self, rng: random.Random,
                      avoid: int) -> Optional[Tuple[np.ndarray, int]]:
-        """
-        A single pedestrian CROP from another image, cached.
-
-        The old path re-decoded a whole source image (imread + flat-field +
-        CLAHE + letterbox) per paste attempt, up to copy_paste_max_objs times
-        per sample. Caching crops makes copy-paste cost one decode per source
-        image for the lifetime of the worker.
-        """
         pool = self._paste_pool()
         if not pool:
             return None
         if len(pool) == 1 and pool[0] == avoid:
             return None
-        for _ in range(4 * len(pool) + 8):
+        # Bounded attempts: 4*len(pool) is O(dataset size) and at 100k images
+        # a pathological pool would spin for millions of iterations.
+        for _ in range(16):
             j = pool[rng.randrange(len(pool))]
             if j == avoid:
                 continue
@@ -572,8 +554,6 @@ class NIRPedDataset(Dataset):
 
         n_try = rng.randint(1, max(1, int(a.copy_paste_max_objs)))
         for _ in range(n_try):
-            # avoid=idx: pasting an image's own crops back into itself
-            # duplicates existing positives instead of adding new ones.
             got = self._paste_patch(rng, avoid=idx)
             if got is None:
                 break
@@ -587,32 +567,17 @@ class NIRPedDataset(Dataset):
             ph = max(3, int(round(patch.shape[0] * f)))
             if pw >= w or ph >= h:
                 continue
-            patch = cv2.resize(patch, (pw, ph),
-                               interpolation=cv2.INTER_LINEAR)
+            patch = cv2.resize(patch, (pw, ph), interpolation=cv2.INTER_LINEAR)
 
-            # Row-constrained placement: for a fixed-mount camera, apparent
-            # pedestrian height is a near-deterministic function of image row
-            # (ground-plane perspective). Pasting at a random row breaks this
-            # prior and teaches the detector that size and row are independent
-            # — the exact correlation that makes far-field NIR pedestrians
-            # learnable.
-            #
-            # F05 (audit fix): under a pinhole ground-plane model the apparent
-            # height and the row OFFSET FROM THE HORIZON are proportional
-            # (both ~ 1/depth), so scaling a patch by f must move its centre
-            # to  h0 + f * (src_row - h0):  a 1.3x LARGER (nearer) patch
-            # belongs LOWER in the frame. The previous code used src_row / f,
-            # which taught the exact INVERSE of the correlation this block
-            # exists to preserve, at copy_paste_p=0.50 on a ~1k-box dataset.
-            # h0 (horizon row, canvas px) comes from aug.copy_paste_horizon_row
-            # — 0.0 (the default) is the pure-proportionality special case.
-            src_row = patch_row   # vertical centre of the source crop
+            # Ground-plane prior: apparent height ~ row offset from the
+            # horizon, so a patch scaled by f belongs at h0 + f*(src_row-h0).
+            src_row = patch_row
             h0 = float(self.aug.copy_paste_horizon_row)
             tgt_row = int(np.clip(h0 + float(f) * (src_row - h0),
                                   ph // 2, h - ph // 2))
             band = max(4, int(0.05 * h))
-            lo_y = max(0, tgt_row - ph // 2 - band)
-            hi_y = max(1, min(h - ph, tgt_row - ph // 2 + band))
+            lo_y = max(0, min(h - ph, tgt_row - ph // 2 - band))
+            hi_y = max(lo_y, min(h - ph, tgt_row - ph // 2 + band))
 
             placed = False
             x0 = y0 = 0
@@ -621,7 +586,8 @@ class NIRPedDataset(Dataset):
                 y0 = int(rng.randint(lo_y, hi_y))
                 cand = np.array([[x0, y0, x0 + pw, y0 + ph]], dtype=np.float32)
                 ref = cur if len(added) == 0 else np.concatenate(
-                    [cur, np.stack(added)], 0)
+                    [cur, np.stack(added)], 0) if cur.shape[0] \
+                    else np.stack(added)
                 if ref.shape[0]:
                     if float(_iou_matrix(cand, ref).max()) > float(a.copy_paste_max_iou):
                         continue
@@ -638,8 +604,7 @@ class NIRPedDataset(Dataset):
                 iy0, iy1 = min(fe, ph // 2), max(ph - fe, ph // 2 + 1)
                 ix0, ix1 = min(fe, pw // 2), max(pw - fe, pw // 2 + 1)
                 inner[iy0:iy1, ix0:ix1] = 1.0
-                alpha = cv2.GaussianBlur(inner, (k, k), 0)
-                alpha = np.clip(alpha, 0.0, 1.0)
+                alpha = np.clip(cv2.GaussianBlur(inner, (k, k), 0), 0.0, 1.0)
 
             roi = img[y0:y0 + ph, x0:x0 + pw]
             img[y0:y0 + ph, x0:x0 + pw] = alpha * patch + (1.0 - alpha) * roi
@@ -651,17 +616,12 @@ class NIRPedDataset(Dataset):
             else np.stack(added)
         return img, _xyxy_px_to_cxcywh(all_xyxy, h, w)
 
-    # ------------------------------------------------------------------ #
+    # ---------------------------------------------------------------- #
 
     def __getitem__(self, idx: int):
         img, boxes, meta = self._load_base(idx)
 
         if self.augment:
-            # Per-sample RNG seeded from the worker's torch seed plus the
-            # epoch, so augmentation is reproducible under a fixed
-            # cfg.train.seed and still differs across workers and epochs. The
-            # epoch term only advances because build_dataloader keeps
-            # persistent_workers off for this split (F14).
             seed = (int(torch.initial_seed() % (2 ** 31 - 1))
                     ^ ((idx * 2654435761) % (2 ** 31))
                     ^ (((int(getattr(self, "_epoch", 0)) + 1) * 40503) % (2 ** 31)))
@@ -675,10 +635,6 @@ class NIRPedDataset(Dataset):
                 f"({self.img_h}, {self.img_w}) after letterbox")
 
         if boxes.shape[0]:
-            # GEOMETRIC clip, in xyxy (F16). Clipping (cx, cy, w, h)
-            # component-wise leaves cx=0.98, w=0.10 untouched, so x2 = 1.03
-            # and TAL then computes IoU against a target that extends past
-            # the image.
             xy = cxcywh_to_xyxy_px(boxes, self.img_h, self.img_w)
             xy[:, 0::2] = np.clip(xy[:, 0::2], 0.0, float(self.img_w))
             xy[:, 1::2] = np.clip(xy[:, 1::2], 0.0, float(self.img_h))
@@ -698,29 +654,15 @@ class NIRPedDataset(Dataset):
 # ===========================================================================
 
 def seed_worker(worker_id: int) -> None:
-    """
-    Per-worker seeding for the numpy and random GLOBAL generators.
-
-    torch.initial_seed() inside a worker already equals base_seed + worker_id,
-    so adding worker_id again (the old behaviour) made the mapping
-    base_seed + 2*worker_id — distinct, but unintentional and hard to reason
-    about (F20).
-    """
     base = torch.initial_seed() % (2 ** 31 - 1)
     np.random.seed(base)
     random.seed(base)
-    # Set cv2 thread count to 0 IN WORKERS ONLY. The main process and other
-    # importers (evaluate.py, export_ncnn.py, quantize_qdq.py) do single-image
-    # imread/resize/CLAHE calls and benefit from OpenCV's default threading.
-    cv2.setNumThreads(0)
+    cv2.setNumThreads(0)      # WORKERS ONLY
 
 
 def collate_fn(batch):
-    """-> (imgs (B,1,H,W), targets list of (N_i,4), metas list of dict)."""
     imgs = torch.stack([b[0] for b in batch], 0)
-    targets = [b[1] for b in batch]
-    metas = [b[2] for b in batch]
-    return imgs, targets, metas
+    return imgs, [b[1] for b in batch], [b[2] for b in batch]
 
 
 def build_dataloader(cfg: Config, split: str, batch_size: Optional[int] = None,
@@ -733,56 +675,31 @@ def build_dataloader(cfg: Config, split: str, batch_size: Optional[int] = None,
     bs = int(cfg.train.batch_size if batch_size is None else batch_size)
     sh = (split == "train") if shuffle is None else bool(shuffle)
     nw = int(cfg.data.num_workers if num_workers is None else num_workers)
-    # The overfit path (train.py --overfit-test) is the one caller that passes
-    # limit=N — it must memorise ALL N images, and drop_last would silently
-    # hide the tail batch. Normal training keeps drop_last so a tiny final
-    # batch cannot destabilise BatchNorm statistics.
     overfit = limit is not None
-
     # persistent_workers MUST be False on any split whose Dataset carries
-    # PER-EPOCH STATE (F14). Workers hold a pickled copy of the dataset made
-    # once at worker start, so set_epoch() on the main-process object never
-    # reaches them: with persistence on, torch.initial_seed() inside a worker
-    # is fixed for the whole run and _epoch stays 0, so the per-sample seed
-    # collapses to a pure function of (idx, worker_id) and every image gets
-    # at most num_workers distinct augmentation draws for a 100-epoch run.
+    # per-epoch state: workers hold a pickled copy, so set_epoch() would
+    # never reach them.
     persist = bool(nw > 0) and not ds.augment
 
     g_shuffle = torch.Generator()
     g_shuffle.manual_seed(int(cfg.train.seed))
-    dl = DataLoader(
-        ds, batch_size=bs, shuffle=sh, num_workers=nw,
+    kwargs = dict(
+        batch_size=bs, shuffle=sh, num_workers=nw,
         pin_memory=bool(cfg.data.pin_memory), collate_fn=collate_fn,
         drop_last=(split == "train" and not overfit and len(ds) > bs),
         persistent_workers=persist,
         worker_init_fn=seed_worker, generator=g_shuffle,
     )
-    # Exposed so train.py can advance the SHUFFLE stream per epoch (F19): a
-    # run resumed at epoch 40 otherwise replays the epoch-0 batch order.
-    # NOTE (F18): this generator is NOT independent of the augmentation
-    # streams. PyTorch draws each worker's base seed from the DataLoader's
-    # `generator`, so torch.initial_seed() inside a worker — which
-    # __getitem__ mixes into its per-sample RNG — moves whenever train.py
-    # reseeds this generator. That is a second, redundant source of
-    # per-epoch augmentation variation on top of NIRPedDataset._epoch;
-    # both are intentional, neither is isolated.
+    if nw > 0:
+        # Bounded prefetch: the default (2 * num_workers batches) holds
+        # 2*nw*bs decoded canvases in RAM, which matters on a 38 GB set.
+        kwargs["prefetch_factor"] = 2
+    dl = DataLoader(ds, **kwargs)
     dl._nirdet_shuffle_generator = g_shuffle
     return dl, ds
 
 
-def build_dataloaders(cfg: Config) -> Dict[str, Tuple[DataLoader, NIRPedDataset]]:
-    out: Dict[str, Tuple[DataLoader, NIRPedDataset]] = {}
-    for split in ("train", "val", "test"):
-        try:
-            out[split] = build_dataloader(
-                cfg, split,
-                batch_size=cfg.train.batch_size if split == "train" else 1,
-                shuffle=(split == "train"),
-                augment=(split == "train"),
-            )
-        except FileNotFoundError as exc:
-            print(f"[data] split '{split}' unavailable: {exc}")
-    return out
+
 
 
 if __name__ == "__main__":
@@ -798,14 +715,10 @@ if __name__ == "__main__":
     print(f"boxes         : {ds.n_boxes}")
     print(f"copy_paste_p  : {ds.copy_paste_p:.3f}  (derived from "
           f"{ds.n_train_boxes} boxes)")
-    print(f"flat-field    : {cfg.aug.flat_field_path}")
-    print(f"clahe_enabled : {cfg.aug.clahe_enabled}")
-
     imgs, tgts, metas = next(iter(dl))
     print(f"batch imgs    : {tuple(imgs.shape)} "
           f"[{float(imgs.min()):.3f}, {float(imgs.max()):.3f}]")
     print(f"boxes/img     : {[int(t.shape[0]) for t in tgts]}")
-
     raw = cv2.imread(ds.images[0], cv2.IMREAD_GRAYSCALE)
     a, *_ = preprocess_frame(raw, cfg.data.img_h, cfg.data.img_w,
                              cfg.aug.clahe_enabled, cfg.aug.clahe_clip,

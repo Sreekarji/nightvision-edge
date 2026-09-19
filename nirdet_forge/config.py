@@ -1,5 +1,5 @@
 """
-config.py — NIRDet-Lite SINGLE SOURCE OF TRUTH
+config.py — NIRDet-Forge SINGLE SOURCE OF TRUTH
 ===============================================
 Single-class (person) NIR pedestrian detector for Raspberry Pi 5 (NCNN INT8)
 and STM32N6570-DK (Neural-ART NPU).
@@ -19,6 +19,10 @@ Rules enforced by this file:
   * Dataset-dependent values (priors, deploy threshold, copy-paste
     probability, EMA tau, EAA projection bias) are DERIVED at runtime, never
     hardcoded. Priors are UNSET by default and their absence is FATAL (F9).
+  * NOTHING in this file may be tuned for one dataset SIZE either: every
+    scale-sensitive knob (copy-paste probability, EMA tau, the norm-floor
+    abort, the bootstrap budget) is expressed as a function or a FRACTION so
+    it behaves the same at 261 images and at 100 000.
 """
 
 from __future__ import annotations
@@ -36,6 +40,11 @@ import numpy as np
 # ===========================================================================
 # DECODE CONTRACT — must be identical in head.py, losses.py, live_nirdet.py,
 # evaluate_onnx.py and nirdet_pp.c. test_decode_contract.py enforces it.
+#
+# DO NOT change any value below without running
+#     python gen_contract_c.py --emit
+# afterwards: nirdet_pp.c is generated from exactly these numbers and its
+# contract stamp is a digest of them.
 # ===========================================================================
 
 DECODE_OFFSET_SCALE: float = 2.0                 # offset range [-0.5, 1.5] cells
@@ -89,7 +98,9 @@ NIRDET_MAX_DET: int = 300
 # before NMS; the Python decoders must match. A crowded frame at
 # eval_score_thresh=0.05 easily exceeds 300 raw candidates, so without this
 # the accuracy gate measures a different result than the device produces.
-# 0 = disabled (Python-only paths). Must be >= NIRDET_MAX_DET or 0.
+# 0 = disabled (Python-only paths). Must be >= NIRDET_MAX_DET or 0, because
+# the C's candidate heap is sized at NIRDET_MAX_DET and a SMALLER Python cap
+# would discard candidates the device keeps.
 PRE_NMS_TOPK: int = NIRDET_MAX_DET   # 300 — matches the C heap exactly
 
 
@@ -282,7 +293,16 @@ class LossCfg:
     tal_beta: float = 6.0
     ramp_frac: float = 0.15
     tal_min_pos_target: float = 0.10       # F64: floor on positive conf targets
-    norm_floor_abort_thresh: int = 50      # F66: per-epoch norm-floor abort limit
+    # FRACTION of an epoch's batches allowed to hit the norm floor before the
+    # run aborts. This MUST be a fraction, never an absolute count: at 261
+    # images / batch 8 an epoch is 32 batches, and at 100 000 images it is
+    # 12 500, so an absolute limit of 50 is "abort never" on the small set and
+    # "abort on a 0.4% empty-batch rate" on the large one — and an all-empty
+    # batch legitimately has no positives on a dataset with empty frames.
+    norm_floor_abort_frac: float = 0.25
+    # Minimum batches observed before the fraction above is allowed to abort,
+    # so a 3-batch smoke run cannot trip it.
+    norm_floor_min_batches: int = 20
 
 
 @dataclass
@@ -368,6 +388,12 @@ class EvalCfg:
     max_hard_cases: int = 12
     bootstrap_n: int = 200                  # 0 disables CI computation
     bootstrap_seed: int = 1234
+    # Total image-updates the bootstrap is allowed to perform
+    # (resamples x images). The cost is O(bootstrap_n * n_images), so a fixed
+    # bootstrap_n that takes 20 s on 165 test images takes ~40 min on a
+    # 20 000-image split. evaluate.py reduces bootstrap_n to respect this
+    # budget and says so.
+    bootstrap_max_updates: int = 200_000
     select_split: str = "val"
     report_split: str = "test"
     int8_max_map50_drop: float = 0.02
@@ -425,7 +451,6 @@ class Config:
         (e.g. on the Pi where the training map may not be present)."""
         if not path:
             return None
-        import hashlib
         try:
             h = hashlib.sha256()
             with open(path, "rb") as fh:
@@ -522,9 +547,13 @@ def calibration_paths(data_root: str, split: str = "train",
     Used by BOTH quantize_qdq.NIRCalibrationReader and
     export_ncnn.build_calibration_images so ORT and NCNN calibrate on
     identical images. seed comes from cfg.export.calib_seed.
+
+    Imports from preprocess (numpy + cv2 only), NOT from dataset (torch):
+    config.py is imported by the torch-free Pi runtime, and a lazy import of
+    a torch module from a config helper is a trap waiting to be sprung.
     """
     import random as _random
-    from dataset import list_images, resolve_split_dirs
+    from preprocess import list_images, resolve_split_dirs
     img_dir, _ = resolve_split_dirs(data_root, split)
     paths = sorted(list_images(img_dir))
     rng = _random.Random(int(seed))
@@ -605,6 +634,23 @@ def validate_config(cfg: Config, verbose: bool = True) -> bool:
     if int(cfg.model.max_det) <= 0:
         errors.append(f"cfg.model.max_det must be > 0, got {cfg.model.max_det}")
 
+    # PRE_NMS_TOPK is the Python mirror of the C candidate heap, which is
+    # sized at NIRDET_MAX_DET. A SMALLER positive value would make the host
+    # decoders throw away candidates the device keeps, so the accuracy gate
+    # would measure something the firmware never produces.
+    if PRE_NMS_TOPK == 0:
+        errors.append(
+            f"PRE_NMS_TOPK=0 (uncapped) is not deployable: nirdet_pp.c has no "
+            f"uncapped mode — its candidate heap is fixed at NIRDET_MAX_DET="
+            f"{NIRDET_MAX_DET}, so the host decoders would feed NMS candidates "
+            f"the device discards. Set PRE_NMS_TOPK = NIRDET_MAX_DET.")
+    if PRE_NMS_TOPK != 0 and PRE_NMS_TOPK < NIRDET_MAX_DET:
+        errors.append(
+            f"PRE_NMS_TOPK={PRE_NMS_TOPK} is smaller than NIRDET_MAX_DET="
+            f"{NIRDET_MAX_DET}: nirdet_pp.c feeds NMS up to NIRDET_MAX_DET "
+            f"candidates, so the Python decoders would discard candidates the "
+            f"device keeps. Set PRE_NMS_TOPK to NIRDET_MAX_DET or 0.")
+
     # F12: CSPBlock splits channel counts in half and raises on odd values —
     # catch it here, before deploy_contract() is hashed.
     for ch_name in ("neck_channels", "neck_out3_channels", "head_channels"):
@@ -618,6 +664,12 @@ def validate_config(cfg: Config, verbose: bool = True) -> bool:
             warns.append(
                 f"model.{ch_name}={v} is not a multiple of 8; Neural-ART and "
                 f"NCNN prefer 8-aligned channel counts for optimal vectorisation.")
+
+    if not (0.0 < float(cfg.loss.norm_floor_abort_frac) <= 1.0):
+        errors.append(
+            f"loss.norm_floor_abort_frac must be in (0, 1]; got "
+            f"{cfg.loss.norm_floor_abort_frac}. It is a FRACTION of an "
+            f"epoch's batches, not a count.")
 
     # F21 / F08 (audit fix): warn when the TRAIN split actually letterboxes
     # with padding at this canvas. Padding is filled with 0.0, which is
@@ -658,7 +710,9 @@ def validate_config(cfg: Config, verbose: bool = True) -> bool:
             "reason Task-Aligned Assignment finds a positive at epoch 0. "
             "Supply a dataset profile:\n"
             "  python dataset_profiles.py --root <path> --out datasets/<n>.yaml\n"
-            "  python train.py --profile datasets/<n>.yaml")
+            "  python train.py --profile datasets/<n>.yaml\n"
+            "(or, for an architecture smoke test only, pass explicit "
+            "--prior-w/--prior-h to train.py)")
     else:
         if not (0.0 < cfg.model.prior_w < 1.0 and 0.0 < cfg.model.prior_h < 1.0):
             errors.append("prior_w / prior_h must be normalised into (0, 1)")
@@ -721,7 +775,7 @@ def validate_config(cfg: Config, verbose: bool = True) -> bool:
         pw = "unset" if cfg.model.prior_w is None else f"{cfg.model.prior_w:.6f}"
         ph = "unset" if cfg.model.prior_h is None else f"{cfg.model.prior_h:.6f}"
         print("=" * 62)
-        print("  NIRDet-Lite config validation")
+        print("  NIRDet-Forge config validation")
         print("=" * 62)
         print(f"  input        : {cfg.data.num_channels}ch x {h}x{w}"
               f"  (AR {w / h:.4f})")
@@ -756,7 +810,9 @@ def validate_config(cfg: Config, verbose: bool = True) -> bool:
         print("=" * 62)
 
     if errors:
-        raise ValueError(f"config invalid: {errors[0]}")
+        raise ValueError(
+            f"config invalid ({len(errors)} error(s)):\n  - "
+            + "\n  - ".join(errors))
     return True
 
 

@@ -746,6 +746,8 @@ def run_bench(engine: NCNNEngine, pp: dict, dec: dict, iters: int) -> int:
     print(f"  network    : {t_net / n * 1e3:7.2f} ms")
     print(f"  decode+nms : {t_dec / n * 1e3:7.2f} ms")
     print(f"  total      : {tot:7.2f} ms  ({1000.0 / max(tot, 1e-6):.1f} fps)")
+    # Machine-readable line; export_ncnn.step_bench greps exactly this.
+    print(f"[bench] avg {tot:.2f} ms")
     print(f"  mean boxes : {n_box / n:.1f} (random input: expect ~0)")
     return 0
 
@@ -756,7 +758,7 @@ def run_bench(engine: NCNNEngine, pp: dict, dec: dict, iters: int) -> int:
 
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(
-        description="NIRDet-Lite Pi 5 runtime (NCNN INT8)")
+        description="NIRDet-Forge Pi 5 runtime (NCNN INT8)")
     ap.add_argument("--param", required=True, help="NCNN .param")
     ap.add_argument("--bin", dest="bin_path", required=True, help="NCNN .bin")
     ap.add_argument("--contract", default=None,
@@ -831,6 +833,11 @@ def main(argv=None) -> int:
     if args.flat_field:
         cfg.aug.flat_field_path = args.flat_field
 
+    if args.max_det is not None:
+        # max_det is HASHED into the deploy contract; override before
+        # verification so verify_contract sees the value this process
+        # actually uses, not the checkpoint's default.
+        cfg.model.max_det = int(args.max_det)
     strides = tuple(int(s) for s in cfg.model.strides)
     contract = load_contract(args.contract)
     verify_contract(contract, cfg, strides)
@@ -850,7 +857,7 @@ def main(argv=None) -> int:
             "measured profile, or --score-thresh explicitly.")
     iou_thresh = (args.iou_thresh if args.iou_thresh is not None
                   else cfg.model.nms_iou_thresh)
-    max_det = args.max_det if args.max_det is not None else cfg.model.max_det
+    max_det = cfg.model.max_det   # already overridden above if --max-det was given
     print(f"[decode] score_thresh {score_thresh:.4f}  iou {iou_thresh:.2f}  "
           f"max_det {max_det}")
 
