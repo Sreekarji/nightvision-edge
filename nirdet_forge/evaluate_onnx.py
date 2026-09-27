@@ -411,7 +411,7 @@ def _boxed(title: str, lines: List[str]) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="ONNX fp32 / INT8 accuracy gate for NIRDet-Lite")
+        description="ONNX fp32 / INT8 accuracy gate for NIRDet-Forge")
     ap.add_argument("--onnx", default=None,
                     help="ONNX graph to evaluate (fp32 or INT8 QDQ)")
     ap.add_argument("--int8", default=None, metavar="PATH",

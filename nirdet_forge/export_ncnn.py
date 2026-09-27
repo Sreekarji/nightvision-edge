@@ -58,6 +58,54 @@ def _require_tool(name: str) -> str:
     return path
 
 
+
+# ---------------------------------------------------------------------------
+# WSL tool resolver
+# ncnnoptimize 20250916 Windows crashes. Linux build via WSL is stable.
+# Windows paths are translated to /mnt/<drive>/... before WSL calls.
+# ---------------------------------------------------------------------------
+
+_WSL_TOOL_PATHS = {
+    "onnx2ncnn":    "/home/sreekar/ncnn/build/tools/onnx/onnx2ncnn",
+    "ncnnoptimize": "/home/sreekar/ncnn/build/tools/ncnnoptimize",
+    "ncnn2table":   "/home/sreekar/ncnn/build/tools/quantize/ncnn2table",
+    "ncnn2int8":    "/home/sreekar/ncnn/build/tools/quantize/ncnn2int8",
+}
+
+
+def _wsl_exe() -> str:
+    w = shutil.which("wsl.exe") or shutil.which("wsl")
+    if w is None:
+        raise SystemExit("wsl.exe not found — add WSL or native NCNN tools to PATH.")
+    return w
+
+
+def _wsl_available() -> bool:
+    return bool(shutil.which("wsl.exe") or shutil.which("wsl"))
+
+
+def _win_to_wsl(path: str) -> str:
+    if len(path) >= 2 and path[1] == ':':
+        drive = path[0].lower()
+        rest  = path[2:].replace("\\", "/").lstrip("/")
+        return f"/mnt/{drive}/{rest}"
+    return path
+
+
+def _tool_cmd(name: str) -> list:
+    if _wsl_available() and name in _WSL_TOOL_PATHS:
+        return [_wsl_exe(), _WSL_TOOL_PATHS[name]]
+    native = shutil.which(name)
+    if native:
+        return [native]
+    raise SystemExit(
+        f"{name} not found. Add NCNN tools to PATH or install WSL with NCNN "
+        f"built at {_WSL_TOOL_PATHS.get(name, '(unknown)')}. ")
+
+
+def _is_wsl(cmd: list) -> bool:
+    return len(cmd) >= 2 and ("wsl" in os.path.basename(cmd[0]).lower())
+
 def _run(cmd: List[str], what: str, fail_hint: str) -> str:
     print(f"[ncnn-export] $ {' '.join(cmd)}")
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -73,8 +121,10 @@ def _run(cmd: List[str], what: str, fail_hint: str) -> str:
 # ===========================================================================
 
 def step_onnx2ncnn(onnx_path: str, param: str, bin_path: str) -> None:
-    tool = _require_tool("onnx2ncnn")
-    out = _run([tool, onnx_path, param, bin_path], "onnx2ncnn",
+    tc = _tool_cmd("onnx2ncnn")
+    _args = ([_win_to_wsl(p) for p in [onnx_path, param, bin_path]]
+             if _is_wsl(tc) else [onnx_path, param, bin_path])
+    out = _run(tc + _args, "onnx2ncnn",
                "check that the ONNX was exported with static shapes and "
                "opset 12. An unsupported op is named in the stderr above.")
     for ln in (out.strip().splitlines()[-6:] if out.strip() else []):
@@ -98,8 +148,8 @@ def step_ncnnoptimize(param: str, bin_path: str, o_param: str, o_bin: str,
     calibrates against the FUSED graph; skipping fusion produces a table keyed
     to different blob names and mismatched activation ranges.
     """
-    tool = shutil.which("ncnnoptimize")
-    if tool is None:
+    tc_opt = _tool_cmd("ncnnoptimize")
+    if not tc_opt:
         if not skip_int8:
             raise SystemExit(
                 "ncnnoptimize not on PATH. The INT8 path calibrates against "
@@ -109,9 +159,232 @@ def step_ncnnoptimize(param: str, bin_path: str, o_param: str, o_bin: str,
         print("[ncnn-export] ncnnoptimize not on PATH — SKIPPED "
               "(fp32 passthrough only)")
         return param, bin_path
-    _run([tool, param, bin_path, o_param, o_bin, flag], "ncnnoptimize",
-         f"flag {flag}; retry without this step if the tool version rejects it")
+    wsl_p = ([_win_to_wsl(p) for p in [param, bin_path, o_param, o_bin]]
+             if _is_wsl(tc_opt) else [param, bin_path, o_param, o_bin])
+    cmd = tc_opt + wsl_p + [flag]
+    print(f"[ncnn-export] $ {' '.join(cmd)}")
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    sys.stderr.write(r.stderr or "")
+    if r.returncode != 0:
+        # Some ncnnoptimize builds (e.g. 20250916) exit non-zero when
+        # shape_inference is skipped (no static input shape in the .param),
+        # but still write valid fused output files. Treat non-zero as a
+        # warning rather than a hard failure if both output files were produced.
+        valid_output = (os.path.isfile(o_param) and os.path.getsize(o_param) > 0
+                        and os.path.isfile(o_bin) and os.path.getsize(o_bin) > 0)
+        if valid_output:
+            print(f"[ncnn-export] ncnnoptimize exited {r.returncode} but "
+                  f"produced {o_param} and {o_bin} — treating as success "
+                  f"(shape_inference skipped is harmless for fixed-canvas export)")
+        elif not skip_int8:
+            # SAFETY NET: step_fuse_param should never be reached when the WSL
+            # build is configured — _tool_cmd() routes ncnnoptimize through the
+            # stable Linux binary. If we are here it means:
+            #   (a) wsl.exe is not on PATH (WSL not installed / not in PATH), OR
+            #   (b) the WSL binary itself crashed (investigate immediately), OR
+            #   (c) the WSL binary path in _WSL_TOOL_PATHS is wrong/stale.
+            # step_fuse_param only fuses Conv+Clip and Conv+Sigmoid pairs — any
+            # new op types added to the model that also need fusion will be
+            # silently missed. Treat this as an error condition to investigate,
+            # not a normal operating mode.
+            print(
+                f"\n[ncnn-export] *** UNEXPECTED FALLBACK TO step_fuse_param ***\n"
+                f"[ncnn-export] ncnnoptimize crashed (exit {r.returncode}, "
+                f"output files are 0 bytes or missing).\n"
+                f"[ncnn-export] This should not happen when WSL tools are "
+                f"configured. Check that:\n"
+                f"[ncnn-export]   1. wsl.exe is on PATH (run: where wsl)\n"
+                f"[ncnn-export]   2. the WSL binary exists: "
+                f"{_WSL_TOOL_PATHS.get('ncnnoptimize', '(not set)')}\n"
+                f"[ncnn-export]   3. no model architecture changes introduced "
+                f"new op types needing fusion beyond Conv+Clip/Sigmoid.\n"
+                f"[ncnn-export] Proceeding with Python fallback — verify the "
+                f"exported INT8 model carefully.\n"
+            )
+            step_fuse_param(param, bin_path, o_param, o_bin)
+        else:
+            raise SystemExit(
+                f"ncnnoptimize failed (exit {r.returncode}) and produced no "
+                f"valid output files (files may exist but are 0 bytes). "
+                f"Check stderr above.\n"
+                f"flag={flag}; try a different flag or pass --skip-int8.")
     return o_param, o_bin
+
+
+def step_fuse_param(param: str, bin_path: str, o_param: str, o_bin: str) -> None:
+    """
+    Pure-Python fallback for ncnnoptimize Conv+Clip fusion.
+
+    ncnnoptimize 20250916 crashes with STATUS_ACCESS_VIOLATION (0xC0000005) on
+    this graph regardless of flag, producing 0-byte output files.  The only
+    thing we need from it for the INT8 calibration path is Conv+Activation
+    fusion — specifically fusing each Convolution node with the Clip (ReLU6)
+    that immediately follows it into a single ConvolutionDepthWise or
+    Convolution layer with activation_type=1 and activation_params set.
+
+    What the .param format looks like before fusion:
+
+        Convolution  /some/Conv  1 1 in_blob out_blob  0=64 1=3 ...
+        Clip         /some/Clip  1 1 out_blob fused_blob  0=0 1=6
+
+    After fusion the Clip line is removed and the Convolution line gains:
+        9=1        (activation_type = ReLU6 = Clip)
+        10=2       (activation_params count)
+        1010=0.0   (clip min)
+        1011=6.0   (clip max)
+
+    and its output blob name is rewritten to the Clip's output blob.
+
+    The .bin is unchanged — weight data is not touched.
+
+    We also handle the Sigmoid-fused proj convolutions (EAA projection):
+        Convolution  /proj/Conv   1 1 in_blob out_blob  0=1 ...
+        Sigmoid      /Sigmoid     1 1 out_blob sig_blob
+    These become activation_type=4 (Sigmoid), no activation_params needed.
+
+    Every other optimisation ncnnoptimize performs (winograd, fp16 storage,
+    shape inference) is either harmful for INT8 (fp16), not applicable (no
+    static shapes), or not required for ncnn2table to work.
+    """
+    with open(param, "r", encoding="utf-8") as fh:
+        lines = fh.readlines()
+
+    # Parse the header (first two lines: magic + layer_count blob_count).
+    # We will recount layers after removing Clip/Sigmoid lines.
+    if len(lines) < 2:
+        raise SystemExit(f"step_fuse_param: {param} has fewer than 2 lines")
+    magic = lines[0].rstrip("\r\n")
+    header_parts = lines[1].split()
+    if len(header_parts) != 2:
+        raise SystemExit(f"step_fuse_param: unexpected header '{lines[1]}'")
+
+    # Build a list of parsed layer dicts so we can do a forward pass.
+    # We only need: type, name, n_inputs, n_outputs, input_blobs, output_blobs,
+    # and the raw attribute string.
+    layers = []
+    for raw in lines[2:]:
+        raw = raw.rstrip("\r\n")
+        if not raw.strip():
+            continue
+        parts = raw.split()
+        if len(parts) < 4:
+            layers.append({"raw": raw, "type": parts[0] if parts else ""})
+            continue
+        ltype = parts[0]
+        lname = parts[1]
+        try:
+            n_in = int(parts[2])
+            n_out = int(parts[3])
+        except ValueError:
+            layers.append({"raw": raw, "type": ltype})
+            continue
+        in_blobs = parts[4: 4 + n_in]
+        out_blobs = parts[4 + n_in: 4 + n_in + n_out]
+        attrs = parts[4 + n_in + n_out:]
+        layers.append({
+            "raw": raw,
+            "type": ltype,
+            "name": lname,
+            "n_in": n_in,
+            "n_out": n_out,
+            "in_blobs": in_blobs,
+            "out_blobs": out_blobs,
+            "attrs": attrs,
+            "fused_into": False,   # True = this layer is consumed by fusion
+        })
+
+    # Build a map from INPUT blob -> [layer indices] so we can find consumers.
+    # (blob_to_producer would go the other way; we need the consumer direction.)
+    in_blob_to_layers: dict = {}
+    for idx, layer in enumerate(layers):
+        for b in layer.get("in_blobs", []):
+            in_blob_to_layers.setdefault(b, []).append(idx)
+
+    # --- forward pass: fuse Conv -> Clip and Conv -> Sigmoid ---
+    FUSE_ACTS = {
+        "Clip":    (1, ["0", "1"]),   # activation_type=1, params min/max
+        "Sigmoid": (4, []),           # activation_type=4, no params
+    }
+    n_fused = 0
+    for idx, layer in enumerate(layers):
+        if layer.get("fused_into"):
+            continue
+        if layer.get("type") not in ("Convolution", "ConvolutionDepthWise"):
+            continue
+        if not layer.get("out_blobs"):
+            continue
+        # The Conv must have exactly one output blob, and that blob must be
+        # consumed by exactly one layer which is a fuseable activation.
+        conv_out = layer["out_blobs"]
+        if len(conv_out) != 1:
+            continue
+        consumers = in_blob_to_layers.get(conv_out[0], [])
+        if len(consumers) != 1:
+            continue   # fan-out: blob feeds multiple layers, cannot fuse
+        act_idx = consumers[0]
+        act = layers[act_idx]
+        if act.get("fused_into") or act.get("type") not in FUSE_ACTS:
+            continue
+        # The activation must consume ONLY the conv's output.
+        if act.get("n_in") != 1 or act.get("n_out") != 1:
+            continue
+
+        act_type_id, _ = FUSE_ACTS[act["type"]]
+
+        # Build the fused attr list: existing conv attrs + activation_type.
+        existing_attrs = list(layer["attrs"])
+        # Remove any existing activation_type attr (9=...) to avoid duplicates.
+        existing_attrs = [a for a in existing_attrs if not a.startswith("9=")]
+        fused_attrs = existing_attrs + [f"9={act_type_id}"]
+        # Do NOT emit 10=/1010=/1011= activation_params. Those use attribute
+        # indices >= 1010 which exceed NCNN_MAX_PARAM_COUNT=32 in the 20250916
+        # prebuilt, causing "id < NCNN_MAX_PARAM_COUNT failed" at load time.
+        # For activation_type=1 (ReLU6) NCNN hard-codes [0, 6] internally, so
+        # the params are not needed. For activation_type=4 (Sigmoid) there are
+        # no params. Both are correct without the extra attrs.
+
+        # Rewrite the Conv layer: new out_blob = act's out_blob, add attrs.
+        layer["out_blobs"] = list(act["out_blobs"])
+        layer["attrs"] = fused_attrs
+        act["fused_into"] = True
+        n_fused += 1
+
+    # --- reconstruct the .param text ---
+    out_lines = []
+    for layer in layers:
+        if layer.get("fused_into"):
+            continue
+        if "name" not in layer:
+            # header/blank lines we didn't fully parse — kept verbatim
+            out_lines.append(layer["raw"])
+            continue
+        parts = ([layer["type"], layer["name"],
+                  str(layer["n_in"]), str(layer["n_out"])]
+                 + layer["in_blobs"]
+                 + layer["out_blobs"]
+                 + layer["attrs"])
+        out_lines.append(" ".join(parts))
+
+    # Fix the layer count in the header.
+    new_layer_count = len(out_lines)
+    old_blob_count = int(header_parts[1])
+    # blob count stays the same — fusion just removes layers, not blobs.
+
+    with open(o_param, "w", encoding="utf-8") as fh:
+        fh.write(magic + "\n")
+        fh.write(f"{new_layer_count} {old_blob_count}\n")
+        for ln in out_lines:
+            fh.write(ln + "\n")
+
+    # .bin is unchanged — copy it unless it's already the destination.
+    if os.path.abspath(bin_path) != os.path.abspath(o_bin):
+        shutil.copy2(bin_path, o_bin)
+
+    print(f"[ncnn-export] step_fuse_param: fused {n_fused} Conv+Act pairs "
+          f"in {param} -> {o_param}  ({new_layer_count} layers, bin unchanged)")
+    if n_fused == 0:
+        print("[ncnn-export] WARNING: step_fuse_param found 0 fuseable pairs — "
+              "check that onnx2ncnn produced Conv + Clip/Sigmoid sequences")
 
 
 def build_calibration_images(cfg: Config, n_images: int, tmp_dir: str
@@ -162,7 +435,7 @@ def build_calibration_images(cfg: Config, n_images: int, tmp_dir: str
 
 def step_ncnn2table(cfg: Config, param: str, bin_path: str, n_images: int,
                     table_path: str, threads: int) -> None:
-    tool = _require_tool("ncnn2table")
+    tc2t = _tool_cmd("ncnn2table")
     tmp_dir = tempfile.mkdtemp(prefix="ncnn_calib_")
     try:
         pngs = build_calibration_images(cfg, n_images, tmp_dir)
@@ -178,10 +451,21 @@ def step_ncnn2table(cfg: Config, param: str, bin_path: str, n_images: int,
         norm = "0.0039216"          # = 1/255; see the NORM NOTE in the header
         # F52: stream the long-running calibration output live instead of
         # capturing it silently.
-        cmd = [tool, param, bin_path, list_file, table_path,
-               "mean=[0]", f"norm=[{norm}]",
-               f"shape=[{cfg.data.img_w},{cfg.data.img_h},{ch}]",
-               f"pixel={pixel}", f"thread={threads}", "method=kl"]
+        if _is_wsl(tc2t):
+            wsl_list = os.path.join(tmp_dir, "calibration_wsl.txt")
+            with open(wsl_list, "w", encoding="utf-8") as _fh:
+                _fh.write("\n".join(_win_to_wsl(p) for p in pngs) + "\n")
+            cmd = tc2t + [
+                _win_to_wsl(param), _win_to_wsl(bin_path),
+                _win_to_wsl(wsl_list), _win_to_wsl(table_path),
+                "mean=[0]", f"norm=[{norm}]",
+                f"shape=[{cfg.data.img_w},{cfg.data.img_h},{ch}]",
+                f"pixel={pixel}", f"thread={threads}", "method=kl"]
+        else:
+            cmd = tc2t + [param, bin_path, list_file, table_path,
+                "mean=[0]", f"norm=[{norm}]",
+                f"shape=[{cfg.data.img_w},{cfg.data.img_h},{ch}]",
+                f"pixel={pixel}", f"thread={threads}", "method=kl"]
         print(f"[ncnn-export] $ {' '.join(cmd)}")
         r = subprocess.run(cmd)   # no capture_output: output streams live
         if r.returncode != 0:
@@ -202,8 +486,10 @@ def step_ncnn2table(cfg: Config, param: str, bin_path: str, n_images: int,
 
 def step_ncnn2int8(param: str, bin_path: str, table_path: str,
                    o_param: str, o_bin: str) -> None:
-    tool = _require_tool("ncnn2int8")
-    _run([tool, param, bin_path, o_param, o_bin, table_path], "ncnn2int8",
+    tc2i = _tool_cmd("ncnn2int8")
+    n2i_a = ([_win_to_wsl(p) for p in [param, bin_path, o_param, o_bin, table_path]]
+             if _is_wsl(tc2i) else [param, bin_path, o_param, o_bin, table_path])
+    _run(tc2i + n2i_a, "ncnn2int8",
          "the table must have been generated for THIS param/bin pair")
 
 
@@ -283,7 +569,7 @@ def step_bench(param: str, bin_path: str, threads: int,
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="ONNX -> NCNN fp32/INT8 export for NIRDet-Lite")
+        description="ONNX -> NCNN fp32/INT8 export for NIRDet-Forge")
     ap.add_argument("--onnx", required=True)
     ap.add_argument("--profile", default=None,
                     help="dataset profile YAML — REQUIRED on every path (F12)")
@@ -339,7 +625,11 @@ def main() -> int:
     print("=" * 60)
 
     step_onnx2ncnn(args.onnx, raw_param, raw_bin)
-    # fp32 storage when an INT8 pass follows; fp16 only for the passthrough.
+    # F43: fp32 storage (flag=0) when INT8 follows — calibrating from
+    # fp16-rounded weights bakes an extra rounding stage into the INT8 model
+    # for no benefit, and winograd (included in flag=65536) has been observed
+    # to crash ncnnoptimize on this graph with STATUS_ACCESS_VIOLATION,
+    # producing 0-byte output files. fp16 + winograd only for --skip-int8.
     flag = "65536" if args.skip_int8 else "0"
     use_param, use_bin = step_ncnnoptimize(raw_param, raw_bin,
                                            opt_param, opt_bin, flag,

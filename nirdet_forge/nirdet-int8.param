@@ -1,0 +1,117 @@
+7767517
+115 139
+Input                    images                   0 1 images
+Split                    splitncnn_input0         1 2 images images_splitncnn_0 images_splitncnn_1
+Convolution              /edge_conv/Conv          1 1 images_splitncnn_1 /edge_conv/Conv_output_0 0=4 1=3 3=2 4=1 6=36 8=2
+UnaryOp                  /Abs                     1 1 /edge_conv/Conv_output_0 /Abs_output_0
+Pooling                  /AveragePool             1 1 /Abs_output_0 /AveragePool_output_0 0=1 1=2 2=2 5=1 6=1
+Pooling                  /AveragePool_1           1 1 /AveragePool_output_0 /AveragePool_1_output_0 0=1 1=2 2=2 5=1 6=1
+Split                    splitncnn_0              1 2 /AveragePool_1_output_0 /AveragePool_1_output_0_splitncnn_0 /AveragePool_1_output_0_splitncnn_1
+Convolution              /backbone/stem/conv/Conv 1 1 images_splitncnn_0 /backbone/stem/act/Clip_output_0 0=16 1=3 3=2 4=1 5=1 6=144 8=102 9=3 -23310=2,0.000000e+00,6.000000e+00
+Convolution              /backbone/widen1/block/conv/Conv 1 1 /backbone/stem/act/Clip_output_0 /backbone/widen1/block/act/Clip_output_0 0=48 1=3 3=2 4=1 5=1 6=6912 8=102 9=3 -23310=2,0.000000e+00,6.000000e+00
+Split                    splitncnn_1              1 2 /backbone/widen1/block/act/Clip_output_0 /backbone/widen1/block/act/Clip_output_0_splitncnn_0 /backbone/widen1/block/act/Clip_output_0_splitncnn_1
+Convolution              /backbone/stage1/cv1/conv/Conv 1 1 /backbone/widen1/block/act/Clip_output_0_splitncnn_1 /backbone/stage1/cv1/act/Clip_output_0 0=24 1=1 5=1 6=1152 8=2 9=3 -23310=2,0.000000e+00,6.000000e+00
+Split                    splitncnn_2              1 2 /backbone/stage1/cv1/act/Clip_output_0 /backbone/stage1/cv1/act/Clip_output_0_splitncnn_0 /backbone/stage1/cv1/act/Clip_output_0_splitncnn_1
+Convolution              /backbone/stage1/blocks/blocks.0/conv/conv/Conv 1 1 /backbone/stage1/cv1/act/Clip_output_0_splitncnn_1 /backbone/stage1/blocks/blocks.0/conv/act/Clip_output_0 0=24 1=3 4=1 5=1 6=5184 8=2 9=3 -23310=2,0.000000e+00,6.000000e+00
+BinaryOp                 /backbone/stage1/blocks/blocks.0/Add 2 1 /backbone/stage1/cv1/act/Clip_output_0_splitncnn_0 /backbone/stage1/blocks/blocks.0/conv/act/Clip_output_0 /backbone/stage1/blocks/blocks.0/Add_output_0
+Clip                     /backbone/stage1/blocks/blocks.0/Clip 1 1 /backbone/stage1/blocks/blocks.0/Add_output_0 /backbone/stage1/blocks/blocks.0/Clip_output_0 0=0.000000e+00 1=6.000000e+00
+Convolution              /backbone/stage1/cv2/conv/Conv 1 1 /backbone/widen1/block/act/Clip_output_0_splitncnn_0 /backbone/stage1/cv2/act/Clip_output_0 0=24 1=1 5=1 6=1152 8=2 9=3 -23310=2,0.000000e+00,6.000000e+00
+Concat                   /backbone/stage1/Concat  2 1 /backbone/stage1/blocks/blocks.0/Clip_output_0 /backbone/stage1/cv2/act/Clip_output_0 /backbone/stage1/Concat_output_0
+Convolution              /backbone/stage1/cv3/conv/Conv 1 1 /backbone/stage1/Concat_output_0 /backbone/stage1/cv3/act/Clip_output_0 0=48 1=1 5=1 6=2304 8=102 9=3 -23310=2,0.000000e+00,6.000000e+00
+Convolution              /backbone/down2/block/conv/Conv 1 1 /backbone/stage1/cv3/act/Clip_output_0 /backbone/down2/block/act/Clip_output_0 0=96 1=3 3=2 4=1 5=1 6=41472 8=102 9=3 -23310=2,0.000000e+00,6.000000e+00
+Split                    splitncnn_3              1 2 /backbone/down2/block/act/Clip_output_0 /backbone/down2/block/act/Clip_output_0_splitncnn_0 /backbone/down2/block/act/Clip_output_0_splitncnn_1
+Convolution              /backbone/stage2/cv1/conv/Conv 1 1 /backbone/down2/block/act/Clip_output_0_splitncnn_1 /backbone/stage2/cv1/act/Clip_output_0 0=48 1=1 5=1 6=4608 8=2 9=3 -23310=2,0.000000e+00,6.000000e+00
+Split                    splitncnn_4              1 2 /backbone/stage2/cv1/act/Clip_output_0 /backbone/stage2/cv1/act/Clip_output_0_splitncnn_0 /backbone/stage2/cv1/act/Clip_output_0_splitncnn_1
+Convolution              /backbone/stage2/blocks/blocks.0/conv/conv/Conv 1 1 /backbone/stage2/cv1/act/Clip_output_0_splitncnn_1 /backbone/stage2/blocks/blocks.0/conv/act/Clip_output_0 0=48 1=3 4=1 5=1 6=20736 8=2 9=3 -23310=2,0.000000e+00,6.000000e+00
+BinaryOp                 /backbone/stage2/blocks/blocks.0/Add 2 1 /backbone/stage2/cv1/act/Clip_output_0_splitncnn_0 /backbone/stage2/blocks/blocks.0/conv/act/Clip_output_0 /backbone/stage2/blocks/blocks.0/Add_output_0
+Clip                     /backbone/stage2/blocks/blocks.0/Clip 1 1 /backbone/stage2/blocks/blocks.0/Add_output_0 /backbone/stage2/blocks/blocks.0/Clip_output_0 0=0.000000e+00 1=6.000000e+00
+Split                    splitncnn_5              1 2 /backbone/stage2/blocks/blocks.0/Clip_output_0 /backbone/stage2/blocks/blocks.0/Clip_output_0_splitncnn_0 /backbone/stage2/blocks/blocks.0/Clip_output_0_splitncnn_1
+Convolution              /backbone/stage2/blocks/blocks.1/conv/conv/Conv 1 1 /backbone/stage2/blocks/blocks.0/Clip_output_0_splitncnn_1 /backbone/stage2/blocks/blocks.1/conv/act/Clip_output_0 0=48 1=3 4=1 5=1 6=20736 8=2 9=3 -23310=2,0.000000e+00,6.000000e+00
+BinaryOp                 /backbone/stage2/blocks/blocks.1/Add 2 1 /backbone/stage2/blocks/blocks.0/Clip_output_0_splitncnn_0 /backbone/stage2/blocks/blocks.1/conv/act/Clip_output_0 /backbone/stage2/blocks/blocks.1/Add_output_0
+Clip                     /backbone/stage2/blocks/blocks.1/Clip 1 1 /backbone/stage2/blocks/blocks.1/Add_output_0 /backbone/stage2/blocks/blocks.1/Clip_output_0 0=0.000000e+00 1=6.000000e+00
+Convolution              /backbone/stage2/cv2/conv/Conv 1 1 /backbone/down2/block/act/Clip_output_0_splitncnn_0 /backbone/stage2/cv2/act/Clip_output_0 0=48 1=1 5=1 6=4608 8=2 9=3 -23310=2,0.000000e+00,6.000000e+00
+Concat                   /backbone/stage2/Concat  2 1 /backbone/stage2/blocks/blocks.1/Clip_output_0 /backbone/stage2/cv2/act/Clip_output_0 /backbone/stage2/Concat_output_0
+Convolution              /backbone/stage2/cv3/conv/Conv 1 1 /backbone/stage2/Concat_output_0 /backbone/stage2/cv3/act/Clip_output_0 0=96 1=1 5=1 6=9216 8=2 9=3 -23310=2,0.000000e+00,6.000000e+00
+Split                    splitncnn_6              1 2 /backbone/stage2/cv3/act/Clip_output_0 /backbone/stage2/cv3/act/Clip_output_0_splitncnn_0 /backbone/stage2/cv3/act/Clip_output_0_splitncnn_1
+Convolution              /backbone/down3/block/conv/Conv 1 1 /backbone/stage2/cv3/act/Clip_output_0_splitncnn_1 /backbone/down3/block/act/Clip_output_0 0=96 1=3 3=2 4=1 5=1 6=82944 8=102 9=3 -23310=2,0.000000e+00,6.000000e+00
+Split                    splitncnn_7              1 2 /backbone/down3/block/act/Clip_output_0 /backbone/down3/block/act/Clip_output_0_splitncnn_0 /backbone/down3/block/act/Clip_output_0_splitncnn_1
+Convolution              /backbone/stage3/cv1/conv/Conv 1 1 /backbone/down3/block/act/Clip_output_0_splitncnn_1 /backbone/stage3/cv1/act/Clip_output_0 0=48 1=1 5=1 6=4608 8=2 9=3 -23310=2,0.000000e+00,6.000000e+00
+Split                    splitncnn_8              1 2 /backbone/stage3/cv1/act/Clip_output_0 /backbone/stage3/cv1/act/Clip_output_0_splitncnn_0 /backbone/stage3/cv1/act/Clip_output_0_splitncnn_1
+Convolution              /backbone/stage3/blocks/blocks.0/conv/conv/Conv 1 1 /backbone/stage3/cv1/act/Clip_output_0_splitncnn_1 /backbone/stage3/blocks/blocks.0/conv/act/Clip_output_0 0=48 1=3 4=1 5=1 6=20736 8=2 9=3 -23310=2,0.000000e+00,6.000000e+00
+BinaryOp                 /backbone/stage3/blocks/blocks.0/Add 2 1 /backbone/stage3/cv1/act/Clip_output_0_splitncnn_0 /backbone/stage3/blocks/blocks.0/conv/act/Clip_output_0 /backbone/stage3/blocks/blocks.0/Add_output_0
+Clip                     /backbone/stage3/blocks/blocks.0/Clip 1 1 /backbone/stage3/blocks/blocks.0/Add_output_0 /backbone/stage3/blocks/blocks.0/Clip_output_0 0=0.000000e+00 1=6.000000e+00
+Split                    splitncnn_9              1 2 /backbone/stage3/blocks/blocks.0/Clip_output_0 /backbone/stage3/blocks/blocks.0/Clip_output_0_splitncnn_0 /backbone/stage3/blocks/blocks.0/Clip_output_0_splitncnn_1
+Convolution              /backbone/stage3/blocks/blocks.1/conv/conv/Conv 1 1 /backbone/stage3/blocks/blocks.0/Clip_output_0_splitncnn_1 /backbone/stage3/blocks/blocks.1/conv/act/Clip_output_0 0=48 1=3 4=1 5=1 6=20736 8=2 9=3 -23310=2,0.000000e+00,6.000000e+00
+BinaryOp                 /backbone/stage3/blocks/blocks.1/Add 2 1 /backbone/stage3/blocks/blocks.0/Clip_output_0_splitncnn_0 /backbone/stage3/blocks/blocks.1/conv/act/Clip_output_0 /backbone/stage3/blocks/blocks.1/Add_output_0
+Clip                     /backbone/stage3/blocks/blocks.1/Clip 1 1 /backbone/stage3/blocks/blocks.1/Add_output_0 /backbone/stage3/blocks/blocks.1/Clip_output_0 0=0.000000e+00 1=6.000000e+00
+Convolution              /backbone/stage3/cv2/conv/Conv 1 1 /backbone/down3/block/act/Clip_output_0_splitncnn_0 /backbone/stage3/cv2/act/Clip_output_0 0=48 1=1 5=1 6=4608 8=2 9=3 -23310=2,0.000000e+00,6.000000e+00
+Concat                   /backbone/stage3/Concat  2 1 /backbone/stage3/blocks/blocks.1/Clip_output_0 /backbone/stage3/cv2/act/Clip_output_0 /backbone/stage3/Concat_output_0
+Convolution              /backbone/stage3/cv3/conv/Conv 1 1 /backbone/stage3/Concat_output_0 /backbone/stage3/cv3/act/Clip_output_0 0=96 1=1 5=1 6=9216 8=2 9=3 -23310=2,0.000000e+00,6.000000e+00
+Split                    splitncnn_10             1 2 /backbone/stage3/cv3/act/Clip_output_0 /backbone/stage3/cv3/act/Clip_output_0_splitncnn_0 /backbone/stage3/cv3/act/Clip_output_0_splitncnn_1
+Convolution              /backbone/down4/block/conv/Conv 1 1 /backbone/stage3/cv3/act/Clip_output_0_splitncnn_1 /backbone/down4/block/act/Clip_output_0 0=96 1=3 3=2 4=1 5=1 6=82944 8=102 9=3 -23310=2,0.000000e+00,6.000000e+00
+Split                    splitncnn_11             1 2 /backbone/down4/block/act/Clip_output_0 /backbone/down4/block/act/Clip_output_0_splitncnn_0 /backbone/down4/block/act/Clip_output_0_splitncnn_1
+Convolution              /backbone/stage4/cv1/conv/Conv 1 1 /backbone/down4/block/act/Clip_output_0_splitncnn_1 /backbone/stage4/cv1/act/Clip_output_0 0=48 1=1 5=1 6=4608 8=2 9=3 -23310=2,0.000000e+00,6.000000e+00
+Split                    splitncnn_12             1 2 /backbone/stage4/cv1/act/Clip_output_0 /backbone/stage4/cv1/act/Clip_output_0_splitncnn_0 /backbone/stage4/cv1/act/Clip_output_0_splitncnn_1
+Convolution              /backbone/stage4/blocks/blocks.0/conv/conv/Conv 1 1 /backbone/stage4/cv1/act/Clip_output_0_splitncnn_1 /backbone/stage4/blocks/blocks.0/conv/act/Clip_output_0 0=48 1=3 2=2 4=2 5=1 6=20736 8=2 9=3 -23310=2,0.000000e+00,6.000000e+00
+BinaryOp                 /backbone/stage4/blocks/blocks.0/Add 2 1 /backbone/stage4/cv1/act/Clip_output_0_splitncnn_0 /backbone/stage4/blocks/blocks.0/conv/act/Clip_output_0 /backbone/stage4/blocks/blocks.0/Add_output_0
+Clip                     /backbone/stage4/blocks/blocks.0/Clip 1 1 /backbone/stage4/blocks/blocks.0/Add_output_0 /backbone/stage4/blocks/blocks.0/Clip_output_0 0=0.000000e+00 1=6.000000e+00
+Convolution              /backbone/stage4/cv2/conv/Conv 1 1 /backbone/down4/block/act/Clip_output_0_splitncnn_0 /backbone/stage4/cv2/act/Clip_output_0 0=48 1=1 5=1 6=4608 8=2 9=3 -23310=2,0.000000e+00,6.000000e+00
+Concat                   /backbone/stage4/Concat  2 1 /backbone/stage4/blocks/blocks.0/Clip_output_0 /backbone/stage4/cv2/act/Clip_output_0 /backbone/stage4/Concat_output_0
+Convolution              /backbone/stage4/cv3/conv/Conv 1 1 /backbone/stage4/Concat_output_0 /backbone/stage4/cv3/act/Clip_output_0 0=96 1=1 5=1 6=9216 8=2 9=3 -23310=2,0.000000e+00,6.000000e+00
+Convolution              /proj/Conv               1 1 /AveragePool_1_output_0_splitncnn_1 /Sigmoid_output_0 0=1 1=1 5=1 6=4 8=2 9=4
+BinaryOp                 /Add                     1 1 /Sigmoid_output_0 /Add_output_0 1=1 2=5.000000e-01
+BinaryOp                 /Mul                     2 1 /backbone/stage2/cv3/act/Clip_output_0_splitncnn_0 /Add_output_0 /Mul_output_0 0=2
+Clip                     /Clip                    1 1 /Mul_output_0 /Clip_output_0 0=0.000000e+00 1=6.000000e+00
+Pooling                  /AveragePool_2           1 1 /AveragePool_1_output_0_splitncnn_0 /AveragePool_2_output_0 0=1 1=2 2=2 5=1 6=1
+Split                    splitncnn_13             1 2 /AveragePool_2_output_0 /AveragePool_2_output_0_splitncnn_0 /AveragePool_2_output_0_splitncnn_1
+Convolution              /proj_1/Conv             1 1 /AveragePool_2_output_0_splitncnn_1 /Sigmoid_1_output_0 0=1 1=1 5=1 6=4 8=2 9=4
+BinaryOp                 /Add_1                   1 1 /Sigmoid_1_output_0 /Add_1_output_0 1=1 2=5.000000e-01
+BinaryOp                 /Mul_1                   2 1 /backbone/stage3/cv3/act/Clip_output_0_splitncnn_0 /Add_1_output_0 /Mul_1_output_0 0=2
+Clip                     /Clip_1                  1 1 /Mul_1_output_0 /Clip_1_output_0 0=0.000000e+00 1=6.000000e+00
+Pooling                  /AveragePool_3           1 1 /AveragePool_2_output_0_splitncnn_0 /AveragePool_3_output_0 0=1 1=2 2=2 5=1 6=1
+Convolution              /proj_2/Conv             1 1 /AveragePool_3_output_0 /Sigmoid_2_output_0 0=1 1=1 5=1 6=4 8=2 9=4
+BinaryOp                 /Add_2                   1 1 /Sigmoid_2_output_0 /Add_2_output_0 1=1 2=5.000000e-01
+BinaryOp                 /Mul_2                   2 1 /backbone/stage4/cv3/act/Clip_output_0 /Add_2_output_0 /Mul_2_output_0 0=2
+Clip                     /Clip_2                  1 1 /Mul_2_output_0 /Clip_2_output_0 0=0.000000e+00 1=6.000000e+00
+Convolution              /neck/lat3/Conv          1 1 /Clip_output_0 /neck/lat3/Conv_output_0 0=64 1=1 5=1 6=6144 8=2
+Convolution              /neck/lat4/Conv          1 1 /Clip_1_output_0 /neck/lat4/Conv_output_0 0=64 1=1 5=1 6=6144 8=2
+Convolution              /neck/lat5/Conv          1 1 /Clip_2_output_0 /neck/lat5/Conv_output_0 0=64 1=1 5=1 6=6144 8=2
+Split                    splitncnn_14             1 2 /neck/lat5/Conv_output_0 /neck/lat5/Conv_output_0_splitncnn_0 /neck/lat5/Conv_output_0_splitncnn_1
+Interp                   /neck/Resize             1 1 /neck/lat5/Conv_output_0_splitncnn_1 /neck/Resize_output_0 0=1 1=2.000000e+00 2=2.000000e+00
+BinaryOp                 /neck/Add                2 1 /neck/lat4/Conv_output_0 /neck/Resize_output_0 /neck/Add_output_0
+Clip                     /neck/Clip               1 1 /neck/Add_output_0 /neck/Clip_output_0 0=-6.000000e+00 1=6.000000e+00
+Split                    splitncnn_15             1 2 /neck/Clip_output_0 /neck/Clip_output_0_splitncnn_0 /neck/Clip_output_0_splitncnn_1
+Interp                   /neck/Resize_1           1 1 /neck/Clip_output_0_splitncnn_1 /neck/Resize_1_output_0 0=1 1=2.000000e+00 2=2.000000e+00
+BinaryOp                 /neck/Add_1              2 1 /neck/lat3/Conv_output_0 /neck/Resize_1_output_0 /neck/Add_1_output_0
+Clip                     /neck/Clip_1             1 1 /neck/Add_1_output_0 /neck/Clip_1_output_0 0=-6.000000e+00 1=6.000000e+00
+Split                    splitncnn_16             1 2 /neck/Clip_1_output_0 /neck/Clip_1_output_0_splitncnn_0 /neck/Clip_1_output_0_splitncnn_1
+Convolution              /neck/pan3to4/block/conv/Conv 1 1 /neck/Clip_1_output_0_splitncnn_1 /neck/pan3to4/block/act/Clip_output_0 0=64 1=3 3=2 4=1 5=1 6=36864 8=2 9=3 -23310=2,0.000000e+00,6.000000e+00
+BinaryOp                 /neck/Add_2              2 1 /neck/Clip_output_0_splitncnn_0 /neck/pan3to4/block/act/Clip_output_0 /neck/Add_2_output_0
+Clip                     /neck/Clip_2             1 1 /neck/Add_2_output_0 /neck/Clip_2_output_0 0=-6.000000e+00 1=6.000000e+00
+Convolution              /neck/out3/conv/Conv     1 1 /neck/Clip_1_output_0_splitncnn_0 /neck/out3/act/Clip_output_0 0=48 1=3 4=1 5=1 6=27648 8=102 9=3 -23310=2,0.000000e+00,6.000000e+00
+Convolution              /neck/out4/conv/Conv     1 1 /neck/Clip_2_output_0 /neck/out4/act/Clip_output_0 0=64 1=3 4=1 5=1 6=36864 8=102 9=3 -23310=2,0.000000e+00,6.000000e+00
+Convolution              /neck/out5/conv/Conv     1 1 /neck/lat5/Conv_output_0_splitncnn_0 /neck/out5/act/Clip_output_0 0=64 1=3 4=1 5=1 6=36864 8=102 9=3 -23310=2,0.000000e+00,6.000000e+00
+Convolution              /stems.0/conv/Conv       1 1 /neck/out3/act/Clip_output_0 /stems.0/act/Clip_output_0 0=64 1=1 5=1 6=3072 8=102 9=3 -23310=2,0.000000e+00,6.000000e+00
+Split                    splitncnn_17             1 2 /stems.0/act/Clip_output_0 /stems.0/act/Clip_output_0_splitncnn_0 /stems.0/act/Clip_output_0_splitncnn_1
+Convolution              /cls_branch/blocks.0/conv/Conv 1 1 /stems.0/act/Clip_output_0_splitncnn_1 /cls_branch/blocks.0/act/Clip_output_0 0=64 1=3 4=1 5=1 6=36864 8=102 9=3 -23310=2,0.000000e+00,6.000000e+00
+Convolution              /cls_pred.0/Conv         1 1 /cls_branch/blocks.0/act/Clip_output_0 cls8 0=1 1=1 5=1 6=64 8=2
+Convolution              /reg_branch/blocks.0/conv/Conv 1 1 /stems.0/act/Clip_output_0_splitncnn_0 /reg_branch/blocks.0/act/Clip_output_0 0=64 1=3 4=1 5=1 6=36864 8=102 9=3 -23310=2,0.000000e+00,6.000000e+00
+Split                    splitncnn_18             1 2 /reg_branch/blocks.0/act/Clip_output_0 /reg_branch/blocks.0/act/Clip_output_0_splitncnn_0 /reg_branch/blocks.0/act/Clip_output_0_splitncnn_1
+Convolution              /off_pred.0/Conv         1 1 /reg_branch/blocks.0/act/Clip_output_0_splitncnn_1 off8 0=2 1=1 5=1 6=128 8=2
+Convolution              /size_pred.0/Conv        1 1 /reg_branch/blocks.0/act/Clip_output_0_splitncnn_0 size8 0=2 1=1 5=1 6=128 8=2
+Convolution              /stems.1/conv/Conv       1 1 /neck/out4/act/Clip_output_0 /stems.1/act/Clip_output_0 0=64 1=1 5=1 6=4096 8=102 9=3 -23310=2,0.000000e+00,6.000000e+00
+Split                    splitncnn_19             1 2 /stems.1/act/Clip_output_0 /stems.1/act/Clip_output_0_splitncnn_0 /stems.1/act/Clip_output_0_splitncnn_1
+Convolution              /cls_branch/blocks.0/conv_1/Conv 1 1 /stems.1/act/Clip_output_0_splitncnn_1 /cls_branch/blocks.0/act_1/Clip_output_0 0=64 1=3 4=1 5=1 6=36864 8=102 9=3 -23310=2,0.000000e+00,6.000000e+00
+Convolution              /cls_pred.1/Conv         1 1 /cls_branch/blocks.0/act_1/Clip_output_0 cls16 0=1 1=1 5=1 6=64 8=2
+Convolution              /reg_branch/blocks.0/conv_1/Conv 1 1 /stems.1/act/Clip_output_0_splitncnn_0 /reg_branch/blocks.0/act_1/Clip_output_0 0=64 1=3 4=1 5=1 6=36864 8=102 9=3 -23310=2,0.000000e+00,6.000000e+00
+Split                    splitncnn_20             1 2 /reg_branch/blocks.0/act_1/Clip_output_0 /reg_branch/blocks.0/act_1/Clip_output_0_splitncnn_0 /reg_branch/blocks.0/act_1/Clip_output_0_splitncnn_1
+Convolution              /off_pred.1/Conv         1 1 /reg_branch/blocks.0/act_1/Clip_output_0_splitncnn_1 off16 0=2 1=1 5=1 6=128 8=2
+Convolution              /size_pred.1/Conv        1 1 /reg_branch/blocks.0/act_1/Clip_output_0_splitncnn_0 size16 0=2 1=1 5=1 6=128 8=2
+Convolution              /stems.2/conv/Conv       1 1 /neck/out5/act/Clip_output_0 /stems.2/act/Clip_output_0 0=64 1=1 5=1 6=4096 8=102 9=3 -23310=2,0.000000e+00,6.000000e+00
+Split                    splitncnn_21             1 2 /stems.2/act/Clip_output_0 /stems.2/act/Clip_output_0_splitncnn_0 /stems.2/act/Clip_output_0_splitncnn_1
+Convolution              /cls_branch/blocks.0/conv_2/Conv 1 1 /stems.2/act/Clip_output_0_splitncnn_1 /cls_branch/blocks.0/act_2/Clip_output_0 0=64 1=3 4=1 5=1 6=36864 8=102 9=3 -23310=2,0.000000e+00,6.000000e+00
+Convolution              /cls_pred.2/Conv         1 1 /cls_branch/blocks.0/act_2/Clip_output_0 cls32 0=1 1=1 5=1 6=64 8=2
+Convolution              /reg_branch/blocks.0/conv_2/Conv 1 1 /stems.2/act/Clip_output_0_splitncnn_0 /reg_branch/blocks.0/act_2/Clip_output_0 0=64 1=3 4=1 5=1 6=36864 8=102 9=3 -23310=2,0.000000e+00,6.000000e+00
+Split                    splitncnn_22             1 2 /reg_branch/blocks.0/act_2/Clip_output_0 /reg_branch/blocks.0/act_2/Clip_output_0_splitncnn_0 /reg_branch/blocks.0/act_2/Clip_output_0_splitncnn_1
+Convolution              /off_pred.2/Conv         1 1 /reg_branch/blocks.0/act_2/Clip_output_0_splitncnn_1 off32 0=2 1=1 5=1 6=128 8=2
+Convolution              /size_pred.2/Conv        1 1 /reg_branch/blocks.0/act_2/Clip_output_0_splitncnn_0 size32 0=2 1=1 5=1 6=128 8=2

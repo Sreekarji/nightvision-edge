@@ -1,5 +1,5 @@
 """
-head.py — PedestrianHead (NIRDet-Lite)
+head.py — PedestrianHead (NIRDet-Forge)
 =======================================
 Single-class, decoupled cls/reg, branch weights shared across levels with
 PER-LEVEL BatchNorm, and the regression output SPLIT into a 2-channel offset

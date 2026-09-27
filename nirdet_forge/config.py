@@ -411,7 +411,7 @@ class ExportCfg:
     onnx_path: str = "nirdet.onnx"
     onnx_sim_path: str = "nirdet-sim.onnx"
     onnx_int8_path: str = "nirdet-int8-qdq.onnx"
-    opset: int = 12
+    opset: int = 13
     calib_images: int = 300
     calib_method: str = "minmax"            # "minmax" | "percentile" | "entropy"
     calib_percentile: float = 99.999
