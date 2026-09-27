@@ -359,6 +359,46 @@ def save_hard_cases(cache: dict, cfg: Config, score_thresh: float,
     return written
 
 
+def save_all_predictions(cache: dict, cfg: Config, score_thresh: float) -> int:
+    """Render every test image with GT (orange) and predictions (green)."""
+    import cv2
+    from preprocess import load_flat_field, preprocess_frame
+
+    out_dir = os.path.join(cfg.eval.out_dir, "predictions")
+    os.makedirs(out_dir, exist_ok=True)
+    ff = load_flat_field(cfg.aug.flat_field_path)
+    written = 0
+
+    for i, (p, g) in enumerate(zip(cache["preds"], cache["gts"])):
+        meta = cache["metas"][i] if i < len(cache["metas"]) else {}
+        path = meta.get("img_path")
+        if not path or not os.path.isfile(path):
+            continue
+        raw = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if raw is None:
+            continue
+        canvas, *_ = preprocess_frame(
+            raw, cfg.data.img_h, cfg.data.img_w,
+            clahe_enabled=cfg.aug.clahe_enabled, clahe_clip=cfg.aug.clahe_clip,
+            clahe_grid=cfg.aug.clahe_grid, flat_field=ff)
+        vis = cv2.cvtColor((canvas * 255.0).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+        for b in g["boxes"].numpy().astype(int).tolist():
+            cv2.rectangle(vis, (int(b[0]), int(b[1])),
+                          (int(b[2]), int(b[3])), (255, 128, 0), 1)
+        pb = p["boxes"].numpy()
+        ps = p["scores"].numpy()
+        for b, s in zip(pb[ps >= score_thresh].astype(int).tolist(),
+                        ps[ps >= score_thresh]):
+            cv2.rectangle(vis, (int(b[0]), int(b[1])),
+                          (int(b[2]), int(b[3])), (0, 220, 0), 1)
+            cv2.putText(vis, f"{float(s):.2f}", (int(b[0]), max(10, int(b[1]) - 3)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 220, 0), 1)
+        stem = os.path.splitext(os.path.basename(path))[0]
+        cv2.imwrite(os.path.join(out_dir, f"{stem}.png"), vis)
+        written += 1
+    return written
+
+
 def load_checkpoint_into(model: NIRDet, path: str, cfg: Config,
                          device: torch.device) -> dict:
     """Load CKPT_DEPLOY_KEY (EMA weights) and verify the decode contract."""
@@ -427,6 +467,8 @@ def main() -> int:
     ap.add_argument("--device", default=None)
     ap.add_argument("--no-bootstrap", action="store_true")
     ap.add_argument("--no-hard-cases", action="store_true")
+    ap.add_argument("--no-render-all", action="store_true",
+                    help="skip rendering all predictions to eval_out/predictions/")
     args = ap.parse_args()
 
     cfg = get_config()
@@ -477,6 +519,15 @@ def main() -> int:
         except Exception as exc:
             print(f"[eval] hard-case rendering failed ({type(exc).__name__}: "
                   f"{exc}); the metrics below are unaffected")
+
+    if not args.no_render_all:
+        try:
+            n_rendered = save_all_predictions(cache, cfg, thr)
+            print(f"[eval] {n_rendered} predictions rendered -> "
+                  f"{os.path.join(cfg.eval.out_dir, 'predictions')}")
+        except Exception as exc:
+            print(f"[eval] render-all failed ({type(exc).__name__}: {exc}); "
+                  f"metrics unaffected")
 
     per_level: Dict[str, float] = {}
     hist_path = os.path.join(os.path.dirname(os.path.abspath(ckpt_path)),
