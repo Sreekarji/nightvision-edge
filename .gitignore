@@ -42,3 +42,9 @@ nirdet_forge/*.exe
 
 # Full NIRPed dataset
 val/
+
+nirdet*.onnx
+nirdet*.bin
+nirdet*.param
+nirdet*.contract.json
+nirdet*.table
