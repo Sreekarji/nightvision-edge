@@ -37,7 +37,10 @@ nirdet_lite/__pycache__/
 # NIRDet-Forge runtime outputs
 nirdet_forge/checkpoints/
 nirdet_forge/datasets/
-nirdet_forge/eval_outputs/
+nirdet_forge/eval_outputs/*
+# ...but the committed eval summary is a result artefact, not a runtime dump
+# (matches nirdet/eval_outputs/summary.json, which is tracked).
+!nirdet_forge/eval_outputs/summary.json
 nirdet_forge/*.exe
 
 # Full NIRPed dataset

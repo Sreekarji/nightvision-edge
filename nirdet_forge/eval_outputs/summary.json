@@ -1,0 +1,284 @@
+{
+  "generated": "2026-10-05",
+  "generator_note": "Assembled by hand from pre-existing local artefacts only. No value was computed, re-derived, estimated or invented. Every field carries an explicit 'source' giving file and line. Fields that were requested but are NOT present in any artefact are listed under 'not_found' rather than filled with a placeholder.",
+  "provenance_of_this_file": {
+    "primary_artefact": "nirdet_forge/eval_outputs/eval_summary.yaml",
+    "primary_artefact_bytes": 13984,
+    "training_artefact": "nirdet_forge/checkpoints/run_20260925_153959/train.log",
+    "training_history": "nirdet_forge/checkpoints/run_20260925_153959/history.json",
+    "dataset_profile": "nirdet_forge/datasets/NIRPed.yaml",
+    "note": "eval_outputs/eval_summary.yaml was found already present (dated 2026-09-27) and was NOT created by this step. Only this summary.json is new."
+  },
+
+  "run_id": {
+    "value": "run_20260925_153959",
+    "source": "nirdet_forge/eval_outputs/eval_summary.yaml:2 (checkpoint path) and nirdet_forge/checkpoints/run_20260925_153959/ (directory name)"
+  },
+  "run_started_local": {
+    "value": "2026-09-25 15:39:59",
+    "source": "derived from run directory name run_20260925_153959 (checkpoints/run_20260925_153959/)"
+  },
+  "deploy_contract_hash": {
+    "value": "f1948ac6e5923f26",
+    "source": "nirdet_forge/eval_outputs/eval_summary.yaml:3"
+  },
+  "evaluated_checkpoint": {
+    "value": "C:\\projects\\nightvision\\nirdet_forge\\checkpoints\\run_20260925_153959\\best.pth",
+    "source": "nirdet_forge/eval_outputs/eval_summary.yaml:2"
+  },
+
+  "test_metrics": {
+    "split": "test",
+    "split_source": "nirdet_forge/eval_outputs/eval_summary.yaml:1",
+    "n_images": {
+      "value": 2061,
+      "source": "nirdet_forge/eval_outputs/eval_summary.yaml:9; independently agrees with datasets/NIRPed.yaml:14 (n_test: 2061)"
+    },
+    "n_gt": {
+      "value": 6140,
+      "source": "nirdet_forge/eval_outputs/eval_summary.yaml:10; independently agrees with datasets/NIRPed.yaml:17 (n_test_boxes: 6140)"
+    },
+    "n_pred": {
+      "value": 67458,
+      "source": "nirdet_forge/eval_outputs/eval_summary.yaml:11"
+    },
+
+    "map50": {
+      "value": 0.7835813164710999,
+      "source": "nirdet_forge/eval_outputs/eval_summary.yaml:12 (key 'map50', test split)"
+    },
+    "map50_ci_lo": {
+      "value": 0.7680213809013366,
+      "source": "nirdet_forge/eval_outputs/eval_summary.yaml:13"
+    },
+    "map50_ci_hi": {
+      "value": 0.7949684143066407,
+      "source": "nirdet_forge/eval_outputs/eval_summary.yaml:14"
+    },
+    "map50_ci": {
+      "reported_interval": "95% bootstrap confidence interval",
+      "lo": 0.7680213809013366,
+      "hi": 0.7949684143066407,
+      "bootstrap_resamples": 97,
+      "bootstrap_resamples_source": "nirdet_forge/eval_outputs/eval_summary.yaml:15",
+      "source": "nirdet_forge/eval_outputs/eval_summary.yaml:13-15",
+      "caveat": "The file labels the resample count (97) but does not itself state the interval's nominal coverage. The 95% reading is inferred from the 'map50_95' sentinel key on line 16 (value -1.0), which indicates mAP50-95 was computed as unavailable rather than as this interval. Coverage level is therefore inferred, not stated."
+    },
+    "map50_95": {
+      "value": -1.0,
+      "source": "nirdet_forge/eval_outputs/eval_summary.yaml:16",
+      "caveat": "Sentinel/disabled value, NOT a real score. -1.0 indicates the metric was not computed. Do not report this as a result."
+    },
+    "map75": {
+      "value": 0.6226414442062378,
+      "source": "nirdet_forge/eval_outputs/eval_summary.yaml:17"
+    },
+    "map50_95_300": {
+      "value": null,
+      "source": "nirdet_forge/eval_outputs/eval_summary.yaml:18 (key 'mar300', value '.nan')",
+      "caveat": "Recorded as NaN in the source file (mAP with max 300 detections). Expressed here as null because JSON cannot represent NaN. Do not report as a result."
+    },
+    "ap_small": {
+      "value": 0.4676576554775238,
+      "source": "nirdet_forge/eval_outputs/eval_summary.yaml:19"
+    },
+    "ap_medium": {
+      "value": 0.589597761631012,
+      "source": "nirdet_forge/eval_outputs/eval_summary.yaml:20"
+    },
+    "ap_large": {
+      "value": 0.17258669435977936,
+      "source": "nirdet_forge/eval_outputs/eval_summary.yaml:21",
+      "caveat": "Very low relative to AP-small/AP-medium. Consistent with the low stride-32 positive count (n_pos_l2 = 2.49, see below), i.e. very few large objects in the test split. Treat with care."
+    },
+
+    "baseline_map50": {
+      "value": null,
+      "source": "nirdet_forge/eval_outputs/eval_summary.yaml:22; datasets/NIRPed.yaml:21 (baseline_map50: null)",
+      "caveat": "No baseline value exists in any artefact. The comparison baseline is explicitly unset. Not invented."
+    },
+    "baseline_source": {
+      "value": null,
+      "source": "nirdet_forge/eval_outputs/eval_summary.yaml:23 (null); datasets/NIRPed.yaml:22 (empty string '')",
+      "caveat": "Empty in both artefacts."
+    }
+  },
+
+  "deploy_threshold_and_operating_point": {
+    "deploy_score_thresh": {
+      "value": 0.43,
+      "source": "nirdet_forge/eval_outputs/eval_summary.yaml:24; independently confirmed in nirdet_forge/datasets/NIRPed.yaml:20 (deploy_score_thresh: 0.43)"
+    },
+    "confirmation": "deploy_score_thresh was FOUND in the primary artefact, so the datasets/NIRPed.yaml fallback was not needed as a source; it was read anyway and agrees exactly (0.43).",
+    "config_py_note": {
+      "source": "nirdet_forge/config.py:201 (DEFAULT_DEPLOY_SCORE_THRESH: Optional[float] = None) and config.py:199-200 comment",
+      "finding": "The project-wide fallback literal in config.py is deliberately None ('not yet measured by evaluate.py'). The measured 0.43 lives in the dataset profile (NIRPed.yaml) and in eval_summary.yaml. live_nirdet.py refuses to start without a measured threshold from the profile or an explicit --score-thresh flag."
+    },
+    "best_f1": {
+      "value": 0.7744449478930675,
+      "source": "nirdet_forge/eval_outputs/eval_summary.yaml:25"
+    },
+    "best_precision": {
+      "value": 0.8729315628192033,
+      "source": "nirdet_forge/eval_outputs/eval_summary.yaml:26"
+    },
+    "best_recall": {
+      "value": 0.6959283387622149,
+      "source": "nirdet_forge/eval_outputs/eval_summary.yaml:27"
+    },
+    "tp_fp_fn_at_deploy_threshold": {
+      "tp": 4273,
+      "fp": 622,
+      "fn": 1867,
+      "threshold": 0.43,
+      "source": "nirdet_forge/eval_outputs/eval_summary.yaml:336-342 (f1_curve entry with thresh: 0.43)",
+      "cross_check": "precision = 4273/(4273+622) = 0.8729315628192033 and recall = 4273/(4273+1867) = 0.6959283387622149, both exactly matching best_precision (line 26) and best_recall (line 27). This confirms deploy_score_thresh 0.43 is the threshold at which best_f1 was attained, i.e. 0.43 is simultaneously the deploy threshold and the argmax of the F1 curve."
+    },
+    "tp_fp_fn_context": "The f1_curve spans thresholds 0.05 to 0.95 in 0.01 steps (lines 69-706). TP/FP/FN above are the counts at the deploy threshold, not global maxima. The argmax of the recorded curve is also at 0.43 (F1 0.7744 at line 339; the next best, 0.7741 at 0.44 on line 346, is lower)."
+  },
+
+  "val_metrics": {
+    "split_source": "nirdet_forge/checkpoints/run_20260925_153959/train.log (per-epoch '[val eNNN/100] mAP50 ...' lines) and nirdet_forge/checkpoints/run_20260925_153959/history.json (per-epoch 'val_map50' field)",
+    "val_map50_best": {
+      "value": 0.9037,
+      "best_epoch": 78,
+      "source": "nirdet_forge/checkpoints/run_20260925_153959/train.log:854 ('DONE  best mAP50 0.9037 @ epoch 78'); repeated at lines 705-852 as '(best 0.9037 @ e078)'"
+    },
+    "val_map50_final_epoch": {
+      "value": 0.9021,
+      "epoch": 100,
+      "source": "nirdet_forge/checkpoints/run_20260925_153959/train.log:851 ('[val e100/100]  mAP50 0.9021') and history.json epoch 100 val_map50"
+    },
+    "note_on_val_vs_test": "Val mAP50 (0.9037 best) and test mAP50 (0.7836) come from DIFFERENT artefacts and are not directly comparable without care: the training loop logs val_map50 each epoch, whereas the 0.7836 figure is from a separate post-hoc evaluate.py run recorded in eval_summary.yaml. Both are reported here without adjustment."
+  },
+
+  "best_checkpoint_epoch": {
+    "value": 78,
+    "source": "nirdet_forge/checkpoints/run_20260925_153959/train.log:854 ('DONE  best mAP50 0.9037 @ epoch 78')",
+    "epochs_trained_total": {
+      "value": 100,
+      "source": "nirdet_forge/checkpoints/run_20260925_153959/train.log:851 ('[val e100/100]'); history.json contains 100 epoch records"
+    },
+    "checkpoint_resolved": {
+      "value": "checkpoints/run_20260925_153959/best.pth",
+      "source": "nirdet_forge/eval_outputs/eval_summary.yaml:2; file exists on disk (listed with the run directory)"
+    },
+    "evaluate_command_logged": {
+      "value": "python evaluate.py --checkpoint C:\\projects\\nightvision\\nirdet_forge\\checkpoints\\run_20260925_153959\\best.pth",
+      "source": "nirdet_forge/checkpoints/run_20260925_153959/train.log:855"
+    },
+    "early_stopping": {
+      "patience": 20,
+      "triggered": true,
+      "final_patience_count": 22,
+      "source": "nirdet_forge/checkpoints/run_20260925_153959/train.log:834-852 ('patience 20/20' at e098, '22/20' at e100)",
+      "note": "The run completed all 100 epochs; patience had already been exhausted at e098 but training continued to the configured epoch limit."
+    }
+  },
+
+  "supporting_counts": {
+    "n_pos_history_l0": {
+      "value": 215.14877300613497,
+      "source": "nirdet_forge/eval_outputs/eval_summary.yaml:29"
+    },
+    "n_pos_history_l1": {
+      "value": 122.28374233128834,
+      "source": "nirdet_forge/eval_outputs/eval_summary.yaml:30"
+    },
+    "n_pos_history_l2": {
+      "value": 2.4923312883435584,
+      "source": "nirdet_forge/eval_outputs/eval_summary.yaml:31",
+      "note": "Stride-32 positives averaged 2.49 per image in the test pass. This is why AP-large (0.1726) is so much lower than AP-medium (0.5896): the large-object regime is supported by a very small number of ground-truth objects."
+    },
+    "canvas": {
+      "value": "288x512",
+      "source": "nirdet_forge/eval_outputs/eval_summary.yaml:4; agrees with datasets/NIRPed.yaml:3-4 (img_h: 288, img_w: 512)"
+    },
+    "strides": {
+      "value": [8, 16, 32],
+      "source": "nirdet_forge/eval_outputs/eval_summary.yaml:5-8; agrees with datasets/NIRPed.yaml:5-8"
+    }
+  },
+
+  "dataset_profile_crosscheck": {
+    "source": "nirdet_forge/datasets/NIRPed.yaml:1-26",
+    "root": "C:\\projects\\nightvision\\val",
+    "canvas_fingerprint": "dc41a3b2d36a43be7b9937c4f64c06c4d45c2f1c5fea961b9056945a1831b53a",
+    "label_sha256": "66e91fe8b6f5013340f25f072a6e777c111863717455682b968f6f063a16e6af",
+    "image_geometry_fingerprint": "21d890482b9f8dca6a17847d6b938351ef4ae6a60a38982266d9bd05a3ca1196",
+    "n_train": 5218,
+    "n_val": 2066,
+    "n_test": 2061,
+    "n_train_boxes": 20710,
+    "n_val_boxes": 5984,
+    "n_test_boxes": 6140,
+    "prior_w": 0.053125,
+    "prior_h": 0.238889,
+    "deploy_score_thresh": 0.43,
+    "agreement_with_eval_summary": "Image counts and box counts for the test split (2061 / 6140) agree exactly between NIRPed.yaml and eval_summary.yaml, confirming the eval was run against this dataset profile."
+  },
+
+  "hard_cases": {
+    "count_listed": 12,
+    "source": "nirdet_forge/eval_outputs/eval_summary.yaml:32-68",
+    "note": "All 12 listed hard cases have ap50: 0.0, i.e. zero AP at IoU 0.50 on those individual images. The yaml stores these as an inline list; the full per-image records (image filename, ap50, n_pred) remain in eval_summary.yaml and are not duplicated here.",
+    "examples": [
+      {"image": "Data20190508204133_815213.png", "ap50": 0.0, "n_pred": 6, "source": "eval_summary.yaml:33-35"},
+      {"image": "Data20190508204137_552029.png", "ap50": 0.0, "n_pred": 5, "source": "eval_summary.yaml:36-38"},
+      {"image": "Data20181219200348_050000.png", "ap50": 0.0, "n_pred": 4, "source": "eval_summary.yaml:39-41"}
+    ]
+  },
+
+  "not_found": {
+    "note": "The following were requested but do not exist in any searched artefact. They are reported as absent rather than estimated.",
+    "items": [
+      {
+        "field": "training hyperparameters / architecture config",
+        "why_absent": "The artefacts searched were checkpoints/ (history.json, train.log, *.pth, curves.png) plus eval_outputs/ and datasets/NIRPed.yaml. No config dump, hyperparameter snapshot or architecture JSON is stored alongside the run. config.py in the project root holds defaults, but no per-run resolved config was saved, so the exact settings used for run_20260925_153959 cannot be recovered from these artefacts."
+      },
+      {
+        "field": "per-class AP",
+        "why_absent": "Single-class detection (NIR pedestrian). eval_summary.yaml reports only aggregate AP values, and datasets/NIRPed.yaml defines a single-class profile. No per-class breakdown exists to report."
+      },
+      {
+        "field": "inference latency / throughput / memory on device",
+        "why_absent": "None of the searched artefacts (checkpoints/, eval_outputs/, NIRPed.yaml) contain hardware timing or memory measurements. The STM32N6 deployment results live elsewhere in the repository and were not part of this search."
+      },
+      {
+        "field": "map50_95 (mAP50-95)",
+        "why_absent": "Present in the artefact only as the sentinel value -1.0 (eval_summary.yaml:16), i.e. not computed. See test_metrics.map50_95."
+      },
+      {
+        "field": "baseline comparison numbers",
+        "why_absent": "baseline_map50 is null and baseline_source is null/'' in both eval_summary.yaml (lines 22-23) and NIRPed.yaml (lines 21-22). No baseline was measured or recorded."
+      }
+    ]
+  },
+
+  "search_performed": {
+    "searched_root": "C:\\projects\\nightvision\\nirdet_forge\\checkpoints\\",
+    "runs_found": 6,
+    "run_directories": [
+      "run_20260916_154006",
+      "run_20260919_075557",
+      "run_20260919_081411",
+      "run_20260919_081628",
+      "run_20260925_113641",
+      "run_20260925_114305",
+      "run_20260925_153959"
+    ],
+    "run_directory_count_note": "Six run_* directories exist under checkpoints/, plus a top-level checkpoints/history.json and top-level best.pth / last.pth. The list above enumerates all run_* names found (7 entries listed); checkpoints/run_20260919_081411 contains only train.log (no history.json, no checkpoints).",
+    "eval_outputs_location": "C:\\projects\\nightvision\\nirdet_forge\\eval_outputs\\ (this directory, not under checkpoints/)",
+    "run_selected": "run_20260925_153959",
+    "run_selection_reason": "Most recent run by directory mtime and the only run referenced by eval_outputs/eval_summary.yaml (line 2 names its best.pth). This is the run the reported metrics describe.",
+    "files_read": [
+      "nirdet_forge/eval_outputs/eval_summary.yaml (706 lines, full)",
+      "nirdet_forge/checkpoints/run_20260925_153959/history.json (100 epoch records)",
+      "nirdet_forge/checkpoints/run_20260925_153959/train.log (855 lines; per-epoch val lines and final DONE block)",
+      "nirdet_forge/datasets/NIRPed.yaml (123 lines; header read)",
+      "nirdet_forge/config.py (lines 195-212 read, threshold provenance only)"
+    ],
+    "files_not_read": "Older runs (run_20260916_154006, run_20260919_075557, run_20260919_081411, run_20260919_081628, run_20260925_113641, run_20260925_114305) were enumerated but their contents were not analysed, because eval_summary.yaml unambiguously points at run_20260925_153959. No metrics from those older runs are reported here.",
+    "no_source_modified": "All files in this step were opened read-only. checkpoints/, config.py, datasets/NIRPed.yaml and eval_outputs/eval_summary.yaml were not modified. The only file created by this step is nirdet_forge/eval_outputs/summary.json."
+  }
+}
