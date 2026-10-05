@@ -246,18 +246,6 @@ cc -DNIRDET_PP_SELFTEST -O2 nirdet_pp.c -lm -o /tmp/nirdet_pp_selftest
 
 The dataset and profile suites include synthetic/temp-directory checks; the decode suite checks consistency across the Python and generated-C contract. The ONNX INT8 evaluation gate is described in the deployment section.
 
-## Audit log
-
-This README documents the repository state after the approved workspace cleanup. The current update changes documentation only; firmware and generated Neural-ART files were not edited, and the changes have not been pushed to GitHub.
-
-- Removed `dataset_change.txt` and the obsolete `nirdet_forge/stedgeai_out/` tree; moved the current Lite profile to `nirdet_lite/datasets/miniNIRPed_261.yaml`. That Lite profile's threshold is `0.3998`; it is not a Forge or STM32 threshold.
-- Retained both Neural-ART output sets under `nirdet_forge/stedgeai_npu_out/`: `network*` is the separate analyze run and `nirdet*` is the generate run. The CubeIDE contract follows the signed-int8 `nirdet` generation, not the unsigned-int8 analyze input.
-- The STM32 CubeIDE project is present in the current inspected GitHub `main` snapshot (`bf926c76759ed8808388b7b1b3e5e9b3a441df05`); the older local worktree used for this README edit does not contain `stm32_cubeide/`.
-- Current upstream `main` tracks `nirdet_forge/eval_outputs/summary.json` and a top-level `LICENSE`. The Forge test metrics and license scope are recorded above; the license is MIT for project-owned code, with ST-generated material retaining its original terms.
-- The GitHub repository About description and topics were verified against the public API. The description advertises 630K parameters, test mAP50 `0.7836`, and the Pi 5 / STM32N6570-DK targets; all 13 topics were present.
-- The archived NIRDet JSON reports epoch 50/mAP50 `0.6161`; the earlier README's epoch 85/mAP50 `0.5951` is a separate predecessor snapshot, not a Forge result.
-- `python gen_contract_c.py --check` and the C postprocessor self-test passed in the earlier audit environment. The Python Forge suites were not run because their required ML dependencies were unavailable there.
-
 ## License
 
 The repository-level [LICENSE](LICENSE) is the MIT License for this project’s own code. It explicitly excludes ST-generated or ST-distributed material, which remains subject to its original terms. In particular, the Neural-ART generated output is licensed by STMicroelectronics under SLA0104 (Rev1/June 2024); refer to the license notice shipped with that output and to the relevant ST source-file headers. Do not interpret the MIT notice as relicensing ST material, datasets or untracked checkpoints.
