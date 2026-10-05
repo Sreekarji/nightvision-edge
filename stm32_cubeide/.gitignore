@@ -1,0 +1,10 @@
+Appli/Debug/
+FSBL/Debug/
+*.o
+*.d
+*.su
+*.cyclo
+*.elf
+*.map
+*.list
+objects.list
